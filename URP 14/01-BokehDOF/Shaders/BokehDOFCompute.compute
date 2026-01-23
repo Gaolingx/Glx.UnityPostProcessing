@@ -1,0 +1,307 @@
+// BokehDOFCompute.compute
+#pragma kernel CSCalculateCoC
+#pragma kernel CSDownsample
+#pragma kernel CSBokehBlur5Tap
+#pragma kernel CSBokehBlur13Tap
+#pragma kernel CSComposite
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
+
+//=============================================================================
+// Textures & Samplers
+// 注意：RWTexture2D 的名称必须与 C# 中 SetComputeTextureParam 设置的名称一致
+//=============================================================================
+
+// 只读纹理
+Texture2D<float4> _SourceTex;
+Texture2D<float> _DepthTex;
+Texture2D<float> _CoCTexRead;
+Texture2D<float4> _DownsampledColorTexRead;
+Texture2D<float> _DownsampledCoCTexRead;
+Texture2D<float4> _BokehTexRead;
+
+// 可写纹理 - 名称必须与C#中设置的完全一致
+RWTexture2D<float> _CoCTex;
+RWTexture2D<float4> _DownsampledColorTex;
+RWTexture2D<float> _DownsampledCoCTex;
+RWTexture2D<float4> _BokehTex;
+RWTexture2D<float4> _ResultTex;
+
+SamplerState sampler_LinearClamp;
+
+//=============================================================================
+// Parameters
+//=============================================================================
+float4 _SourceSize;          // (width, height, 1/width, 1/height)
+float4 _DownsampledSize;     // (width, height, 1/width, 1/height)
+float4 _DOFParams;           // (focusDistance, focusRange, cocScale, maxBlur)
+float4 _BlurParams;          // (nearScale, farScale, downsampledMaxBlur, unused)
+float4 _BokehParams;         // (bokehIntensity, highlightThreshold, unused, unused)
+float4 _CameraParams;        // (near, far, far-near, near*far)
+
+#define FOCUS_DISTANCE  _DOFParams.x
+#define FOCUS_RANGE     _DOFParams.y
+#define COC_SCALE       _DOFParams.z
+#define MAX_BLUR        _DOFParams.w
+
+#define NEAR_SCALE      _BlurParams.x
+#define FAR_SCALE       _BlurParams.y
+#define DOWN_MAX_BLUR   _BlurParams.z
+
+#define BOKEH_INTENSITY     _BokehParams.x
+#define HIGHLIGHT_THRESHOLD _BokehParams.y
+
+//=============================================================================
+// Golden Ratio Sampling Points (5-tap)
+//=============================================================================
+static const float GOLDEN_ANGLE = 2.39996323;  // PI * (3 - sqrt(5))
+
+float2 GetGoldenSample(int index, int totalSamples)
+{
+    float r = sqrt((float)(index + 1) / (float)totalSamples);
+    float theta = (index + 1) * GOLDEN_ANGLE;
+    return float2(cos(theta), sin(theta)) * r;
+}
+
+//=============================================================================
+// 13-tap Disc Sampling Points
+//=============================================================================
+static const float2 DISC_SAMPLES_13[13] = 
+{
+    float2(0.0, 0.0),
+    // Inner ring (6 samples)
+    float2(0.5, 0.0),
+    float2(0.25, 0.433),
+    float2(-0.25, 0.433),
+    float2(-0.5, 0.0),
+    float2(-0.25, -0.433),
+    float2(0.25, -0.433),
+    // Outer ring (6 samples)
+    float2(1.0, 0.0),
+    float2(0.5, 0.866),
+    float2(-0.5, 0.866),
+    float2(-1.0, 0.0),
+    float2(-0.5, -0.866),
+    float2(0.5, -0.866)
+};
+
+static const float DISC_WEIGHTS_13[13] = 
+{
+    0.125,
+    0.125, 0.125, 0.125, 0.125, 0.125, 0.125,
+    0.0625, 0.0625, 0.0625, 0.0625, 0.0625, 0.0625
+};
+
+//=============================================================================
+// Helper Functions
+//=============================================================================
+float LinearEyeDepth(float rawDepth)
+{
+    #if UNITY_REVERSED_Z
+        rawDepth = 1.0 - rawDepth;
+    #endif
+    return _CameraParams.w / (_CameraParams.y - rawDepth * _CameraParams.z);
+}
+
+float CalculateCoC(float depth)
+{
+    float diff = depth - FOCUS_DISTANCE;
+    float coc = diff * COC_SCALE;
+    
+    if (diff < 0)
+        coc *= NEAR_SCALE;
+    else
+        coc *= FAR_SCALE;
+    
+    return clamp(coc, -MAX_BLUR, MAX_BLUR);
+}
+
+float3 ApplyBokehHighlight(float3 color, float coc)
+{
+    float luminance = Luminance(color);
+    float highlight = max(0, luminance - HIGHLIGHT_THRESHOLD);
+    float bokehBoost = 1.0 + highlight * BOKEH_INTENSITY * abs(coc) / max(MAX_BLUR, 0.001);
+    return color * bokehBoost;
+}
+
+//=============================================================================
+// Kernel 0: Calculate CoC
+//=============================================================================
+[numthreads(8, 8, 1)]
+void CSCalculateCoC(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_SourceSize.x || id.y >= (uint)_SourceSize.y)
+        return;
+    
+    float depth = _DepthTex[id.xy];
+    float linearDepth = LinearEyeDepth(depth);
+    float coc = CalculateCoC(linearDepth);
+    
+    // 归一化CoC到[-1, 1]范围
+    _CoCTex[id.xy] = coc / max(MAX_BLUR, 0.001);
+}
+
+//=============================================================================
+// Kernel 1: Downsample
+//=============================================================================
+[numthreads(8, 8, 1)]
+void CSDownsample(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_DownsampledSize.x || id.y >= (uint)_DownsampledSize.y)
+        return;
+    
+    float2 uv = (id.xy + 0.5) * _DownsampledSize.zw;
+    float2 texelSize = _SourceSize.zw;
+    
+    // 4-tap bilinear downsample
+    float4 color = 0;
+    float coc = 0;
+    
+    float2 offsets[4] = {
+        float2(-0.5, -0.5),
+        float2(0.5, -0.5),
+        float2(-0.5, 0.5),
+        float2(0.5, 0.5)
+    };
+    
+    [unroll]
+    for (int i = 0; i < 4; i++)
+    {
+        float2 sampleUV = uv + offsets[i] * texelSize;
+        color += _SourceTex.SampleLevel(sampler_LinearClamp, sampleUV, 0);
+        coc += _CoCTexRead.SampleLevel(sampler_LinearClamp, sampleUV, 0);
+    }
+    
+    color *= 0.25;
+    coc *= 0.25;
+    
+    // 应用Bokeh高光增强
+    color.rgb = ApplyBokehHighlight(color.rgb, coc * MAX_BLUR);
+    
+    _DownsampledColorTex[id.xy] = color;
+    _DownsampledCoCTex[id.xy] = coc;
+}
+
+//=============================================================================
+// Kernel 2: 5-Tap Golden Bokeh Blur
+//=============================================================================
+[numthreads(8, 8, 1)]
+void CSBokehBlur5Tap(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_DownsampledSize.x || id.y >= (uint)_DownsampledSize.y)
+        return;
+    
+    float2 uv = (id.xy + 0.5) * _DownsampledSize.zw;
+    float2 texelSize = _DownsampledSize.zw;
+    
+    float centerCoC = _DownsampledCoCTexRead.SampleLevel(sampler_LinearClamp, uv, 0);
+    float blurRadius = abs(centerCoC) * DOWN_MAX_BLUR;
+    
+    // 中心采样
+    float4 color = _DownsampledColorTexRead.SampleLevel(sampler_LinearClamp, uv, 0);
+    float totalWeight = 1.0;
+    
+    const int NUM_SAMPLES = 5;
+    
+    [unroll]
+    for (int i = 0; i < NUM_SAMPLES; i++)
+    {
+        float2 offset = GetGoldenSample(i, NUM_SAMPLES) * blurRadius * texelSize;
+        float2 sampleUV = uv + offset;
+        
+        float4 sampleColor = _DownsampledColorTexRead.SampleLevel(sampler_LinearClamp, sampleUV, 0);
+        float sampleCoC = _DownsampledCoCTexRead.SampleLevel(sampler_LinearClamp, sampleUV, 0);
+        
+        // 基于CoC的权重计算
+        float sampleRadius = abs(sampleCoC) * DOWN_MAX_BLUR;
+        float dist = length(offset / texelSize);
+        
+        // 只有当采样点的CoC足够大时才贡献
+        float weight = saturate(sampleRadius - dist + 1.0);
+        weight = max(weight, 0.1);
+        
+        color += sampleColor * weight;
+        totalWeight += weight;
+    }
+    
+    color /= totalWeight;
+    _BokehTex[id.xy] = color;
+}
+
+//=============================================================================
+// Kernel 3: 13-Tap Disc Bokeh Blur
+//=============================================================================
+[numthreads(8, 8, 1)]
+void CSBokehBlur13Tap(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_DownsampledSize.x || id.y >= (uint)_DownsampledSize.y)
+        return;
+    
+    float2 uv = (id.xy + 0.5) * _DownsampledSize.zw;
+    float2 texelSize = _DownsampledSize.zw;
+    
+    float centerCoC = _DownsampledCoCTexRead.SampleLevel(sampler_LinearClamp, uv, 0);
+    float blurRadius = abs(centerCoC) * DOWN_MAX_BLUR;
+    
+    float4 foreground = 0;
+    float4 background = 0;
+    float foregroundWeight = 0;
+    float backgroundWeight = 0;
+    
+    [unroll]
+    for (int i = 0; i < 13; i++)
+    {
+        float2 offset = DISC_SAMPLES_13[i] * blurRadius * texelSize;
+        float2 sampleUV = uv + offset;
+        
+        float4 sampleColor = _DownsampledColorTexRead.SampleLevel(sampler_LinearClamp, sampleUV, 0);
+        float sampleCoC = _DownsampledCoCTexRead.SampleLevel(sampler_LinearClamp, sampleUV, 0);
+        
+        float dist = length(DISC_SAMPLES_13[i]);
+        float sampleBlur = abs(sampleCoC) * DOWN_MAX_BLUR;
+        
+        // 前景/背景分离权重
+        float bgWeight = saturate((sampleBlur - dist * blurRadius + 1.0) * 0.5);
+        float fgWeight = saturate((-sampleCoC * DOWN_MAX_BLUR - dist * blurRadius + 1.0) * 0.5);
+        
+        bgWeight *= DISC_WEIGHTS_13[i];
+        fgWeight *= DISC_WEIGHTS_13[i];
+        
+        background += sampleColor * bgWeight;
+        foreground += sampleColor * fgWeight;
+        backgroundWeight += bgWeight;
+        foregroundWeight += fgWeight;
+    }
+    
+    background /= max(backgroundWeight, 0.001);
+    foreground /= max(foregroundWeight, 0.001);
+    
+    // 混合前景和背景
+    float fgAlpha = saturate(foregroundWeight * 2.0);
+    float4 result = lerp(background, foreground, fgAlpha);
+    
+    _BokehTex[id.xy] = result;
+}
+
+//=============================================================================
+// Kernel 4: Composite
+//=============================================================================
+[numthreads(8, 8, 1)]
+void CSComposite(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_SourceSize.x || id.y >= (uint)_SourceSize.y)
+        return;
+    
+    float2 uv = (id.xy + 0.5) * _SourceSize.zw;
+    
+    float4 source = _SourceTex.SampleLevel(sampler_LinearClamp, uv, 0);
+    float4 bokeh = _BokehTexRead.SampleLevel(sampler_LinearClamp, uv, 0);
+    float coc = _CoCTexRead.SampleLevel(sampler_LinearClamp, uv, 0);
+    
+    // 基于CoC进行平滑混合
+    float blend = smoothstep(0.1, 1.0, abs(coc));
+    
+    float4 result = lerp(source, bokeh, blend);
+    _ResultTex[id.xy] = result;
+}
