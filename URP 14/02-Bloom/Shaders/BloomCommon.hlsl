@@ -1,0 +1,28 @@
+// BloomCommon.hlsl
+#ifndef BLOOM_COMMON_INCLUDED
+#define BLOOM_COMMON_INCLUDED
+
+// Quadratic color thresholding
+// curve = (threshold - knee, knee * 2, 0.25 / knee)
+float3 QuadraticThreshold(float3 color, float threshold, float3 curve)
+{
+    // Pixel brightness
+    float br = max(max(color.r, color.g), color.b);
+
+    // Under-threshold part
+    float rq = clamp(br - curve.x, 0.0, curve.y);
+    rq = curve.z * rq * rq;
+
+    // Combine and apply the brightness response curve
+    color *= max(rq, br - threshold) / max(br, 1e-4);
+
+    return color;
+}
+
+// Luminance calculation
+float LuminanceSampleInput(float3 color)
+{
+    return dot(color, float3(0.2126729, 0.7151522, 0.0721750));
+}
+
+#endif // BLOOM_COMMON_INCLUDED
