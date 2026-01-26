@@ -1,0 +1,265 @@
+#pragma kernel CSEdgeAwareSpatialDenoise
+#pragma kernel CSPoissonDiskDenoise
+
+#pragma multi_compile _ _GBUFFER_NORMALS_OCT
+
+#include "SSGICommon.hlsl"
+
+// Group shared memory for efficient neighbor access
+groupshared float4 gs_ColorDepth[10 * 10]; // 8x8 + border
+groupshared float3 gs_Normals[10 * 10];
+
+//=============================================================================
+// Edge-Avoiding A-Trous Wavelet Denoise (Pass 3 equivalent)
+//=============================================================================
+[numthreads(SSGI_TILE_SIZE, SSGI_TILE_SIZE, 1)]
+void CSEdgeAwareSpatialDenoise(uint3 dispatchThreadId : SV_DispatchThreadID,
+                                uint3 groupThreadId : SV_GroupThreadID,
+                                uint groupIndex : SV_GroupIndex)
+{
+    // Load data into shared memory with border
+    int2 groupBase = int2(dispatchThreadId.xy) - int2(groupThreadId.xy) - 1;
+    
+    // Each thread loads multiple samples
+    for (int i = groupIndex; i < 100; i += 64)
+    {
+        int2 localCoord = int2(i % 10, i / 10);
+        int2 globalCoord = groupBase + localCoord;
+        
+        float2 uv = (globalCoord + 0.5) * _SSGIIndirectTextureSizes.zw;
+        uv = saturate(uv);
+        
+        float4 colorDist = _SSGIInputTexture.SampleLevel(sampler_PointClamp, uv, 0);
+        float depth = _CameraDepthTexture.SampleLevel(sampler_PointClamp, uv, 0);
+        float3 normal = _GBuffer2.SampleLevel(sampler_PointClamp, uv, 0).rgb;
+        
+        gs_ColorDepth[i] = float4(colorDist.rgb, ConvertLinearEyeDepth(depth));
+        gs_Normals[i] = DecodeNormalFromGBuffer(normal);
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    uint2 pixelCoord = dispatchThreadId.xy;
+    float2 texSize = _SSGIIndirectTextureSizes.xy;
+    
+    if (any(pixelCoord >= (uint2)texSize))
+        return;
+    
+    float2 uv = (pixelCoord + 0.5) * _SSGIIndirectTextureSizes.zw;
+    
+    // Center sample
+    int2 localCenter = int2(groupThreadId.xy) + 1;
+    int centerIdx = localCenter.y * 10 + localCenter.x;
+    
+    float4 centerColorDist = gs_ColorDepth[centerIdx];
+    float3 centerColor = centerColorDist.rgb;
+    float centerDepth = centerColorDist.w;
+    float3 centerNormal = gs_Normals[centerIdx];
+    float hitDistance = _SSGIInputTexture.SampleLevel(sampler_PointClamp, uv, 0).a;
+    
+    // Check for background
+    if (centerDepth <= 0)
+    {
+        _SSGIOutput[pixelCoord] = float4(centerColor, hitDistance);
+        return;
+    }
+    
+    // Dynamic blur radius based on hit distance
+    float blurAmount = (hitDistance < 1.0 && _HistoryTextureValid > 0) ? 0.05 : 1.0;
+    
+    float minRange = max(2.0 * _DownSample, 2.0);
+    float maxRange = max(5.0 * _DownSample, minRange + 4.0);
+    float random = SSGIGenerateHashedRandomFloat(uint3(pixelCoord, 1));
+    float2 intensity = floor(lerp(minRange, maxRange, random)) * _SSGIIndirectTextureSizes.zw;
+    
+    // 3x3 Gaussian kernel offsets and weights (excluding center)
+    static const int2 offsets[8] = {
+        int2(-1, -1), int2(0, -1), int2(1, -1),
+        int2(-1, 0),              int2(1, 0),
+        int2(-1, 1),  int2(0, 1),  int2(1, 1)
+    };
+    
+    static const float kernel[8] = {
+        0.0625, 0.125, 0.0625,
+        0.125,        0.125,
+        0.0625, 0.125, 0.0625
+    };
+    
+    // Accumulate filtered result
+    float sumWeight = 0.25; // Center weight
+    float3 sumColor = centerColor * sumWeight;
+    
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        int2 sampleOffset = int2(round(offsets[i] * intensity / _SSGIIndirectTextureSizes.zw));
+        int2 localSample = localCenter + sampleOffset;
+        localSample = clamp(localSample, int2(0, 0), int2(9, 9));
+        
+        int sampleIdx = localSample.y * 10 + localSample.x;
+        
+        float3 sampleColor = gs_ColorDepth[sampleIdx].rgb;
+        float sampleDepth = gs_ColorDepth[sampleIdx].w;
+        float3 sampleNormal = gs_Normals[sampleIdx];
+        
+        // Normal weight
+        float3 normalDiff = centerNormal - sampleNormal;
+        float normalDist = dot(normalDiff, normalDiff);
+        float normalWeight = min(exp(-normalDist * 20.0), 1.0);
+        
+        // Depth weight
+        float depthDiff = centerDepth - sampleDepth;
+        float depthDist = depthDiff * depthDiff;
+        float depthWeight = min(exp(-depthDist), 1.0);
+        
+        float weight = normalWeight * depthWeight * kernel[i];
+        
+        sumColor += sampleColor * weight;
+        sumWeight += weight;
+    }
+    
+    float3 result = lerp(centerColor, sumColor / sumWeight, blurAmount);
+    
+    _SSGIOutput[pixelCoord] = float4(result, hitDistance);
+}
+
+//=============================================================================
+// Poisson Disk Recurrent Denoise (Pass 8 equivalent - ReBLUR-style)
+//=============================================================================
+
+// Poisson disk samples
+static const float3 k_PoissonSamples[8] = {
+    float3(-1.0, 0.0, 1.0),
+    float3(0.0, 1.0, 1.0),
+    float3(1.0, 0.0, 1.0),
+    float3(0.0, -1.0, 1.0),
+    float3(-0.3536, 0.3536, 0.5),
+    float3(0.3536, 0.3536, 0.5),
+    float3(0.3536, -0.3536, 0.5),
+    float3(-0.3536, -0.3536, 0.5)
+};
+
+static const float k_GaussianWeights[8] = {
+    0.519, 0.519, 0.519, 0.519,
+    0.651, 0.651, 0.651, 0.651
+};
+
+float2 RotateVector(float4 rotator, float2 v)
+{
+    return v.x * rotator.xz + v.y * rotator.yw;
+}
+
+float3x3 SSGIGetLocalFrame(float3 N)
+{
+    float3 up = abs(N.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+    float3 T = normalize(cross(up, N));
+    float3 B = cross(N, T);
+    return float3x3(T, B, N);
+}
+
+[numthreads(SSGI_TILE_SIZE, SSGI_TILE_SIZE, 1)]
+void CSPoissonDiskDenoise(uint3 dispatchThreadId : SV_DispatchThreadID,
+                          uint3 groupThreadId : SV_GroupThreadID,
+                          uint groupIndex : SV_GroupIndex)
+{
+    uint2 pixelCoord = dispatchThreadId.xy;
+    float2 texSize = _SSGIIndirectTextureSizes.xy;
+    
+    if (any(pixelCoord >= (uint2)texSize))
+        return;
+    
+    float2 uv = (pixelCoord + 0.5) * _SSGIIndirectTextureSizes.zw;
+    
+    // Sample center
+    float depth = _CameraDepthTexture.SampleLevel(sampler_PointClamp, uv, 0);
+    
+    if (IsBackground(depth))
+    {
+        _SSGIOutput[pixelCoord] = _SSGIInputTexture.SampleLevel(sampler_PointClamp, uv, 0);
+        return;
+    }
+    
+#if !UNITY_REVERSED_Z
+    depth = lerp(UNITY_NEAR_CLIP_VALUE, 1, depth);
+#endif
+    
+    float3 positionWS = ComputeWorldSpacePositionFromDepth(uv, depth);
+    float3 cameraPos = GetCameraPositionWS();
+    float3 viewDir = normalize(cameraPos - positionWS);
+    
+    float3 normalWS = DecodeNormalFromGBuffer(_GBuffer2.SampleLevel(sampler_PointClamp, uv, 0).rgb);
+    
+    float4 centerSignal = _SSGIInputTexture.SampleLevel(sampler_PointClamp, uv, 0);
+    float centerDepthLinear = Linear01Depth(depth, _ZBufferParams);
+    
+    // Build kernel basis
+    float3x3 localFrame = SSGIGetLocalFrame(normalWS);
+    float3 T = localFrame[0] * _ReBlurDenoiserRadius;
+    float3 B = localFrame[1] * _ReBlurDenoiserRadius;
+    
+    // Accumulate
+    float4 signalSum = float4(0, 0, 0, 0);
+    float sumWeight = 0;
+    
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        float3 offset = k_PoissonSamples[i];
+        offset.xy = RotateVector(_ReBlurBlurRotator, offset.xy);
+        
+        // Compute sample world position
+        float3 samplePosWS = positionWS + T * offset.x + B * offset.y;
+        
+        // Project to screen
+        float4 samplePosCS = mul(UNITY_MATRIX_VP, float4(samplePosWS, 1));
+        float2 sampleUV = (samplePosCS.xy / samplePosCS.w) * 0.5 + 0.5;
+        
+#if UNITY_UV_STARTS_AT_TOP
+        sampleUV.y = 1.0 - sampleUV.y;
+#endif
+        
+        // Check bounds
+        if (any(sampleUV < 0) || any(sampleUV > 1))
+            continue;
+        
+        // Sample
+        float sampleDepth = _CameraDepthTexture.SampleLevel(sampler_PointClamp, sampleUV, 0);
+        
+#if !UNITY_REVERSED_Z
+        sampleDepth = lerp(UNITY_NEAR_CLIP_VALUE, 1, sampleDepth);
+#endif
+        
+        float sampleDepthLinear = Linear01Depth(sampleDepth, _ZBufferParams);
+        float3 sampleNormal = DecodeNormalFromGBuffer(_GBuffer2.SampleLevel(sampler_PointClamp, sampleUV, 0).rgb);
+        float3 samplePosWSActual = ComputeWorldSpacePositionFromDepth(sampleUV, sampleDepth);
+        
+        // Weights
+        float depthWeight = max(0, 1.0 - abs(sampleDepthLinear - centerDepthLinear));
+        
+        float normalDot = saturate(dot(sampleNormal, normalWS));
+        float normalWeight = normalDot * normalDot * normalDot * normalDot;
+        
+        float3 dq = positionWS - samplePosWSActual;
+        float dist2 = dot(dq, dq);
+        float planeError = max(abs(dot(dq, sampleNormal)), abs(dot(dq, normalWS)));
+        float planeWeight = (dist2 < 0.0001) ? 1.0 : pow(max(0, 1.0 - 2.0 * planeError / sqrt(dist2)), 2.0);
+        
+        float w = k_GaussianWeights[i] * depthWeight * normalWeight * planeWeight;
+        
+        if (!IsBackground(sampleDepth) && w > 0)
+        {
+            float4 sampleSignal = _SSGIInputTexture.SampleLevel(sampler_PointClamp, sampleUV, 0);
+            
+            if (dot(sampleSignal.rgb, float3(1, 1, 1)) > 0)
+            {
+                signalSum += sampleSignal * w;
+                sumWeight += w;
+            }
+        }
+    }
+    
+    float4 result = (sumWeight > 0) ? signalSum / sumWeight : centerSignal;
+    result = max(result, float4(0, 0, 0, 0));
+    
+    _SSGIOutput[pixelCoord] = result;
+}

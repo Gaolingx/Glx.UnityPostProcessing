@@ -1,0 +1,30 @@
+#pragma kernel CSUpdateHistoryBuffers
+
+#include "SSGICommon.hlsl"
+
+//=============================================================================
+// Update all history buffers in a single pass
+//=============================================================================
+[numthreads(SSGI_TILE_SIZE, SSGI_TILE_SIZE, 1)]
+void CSUpdateHistoryBuffers(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 pixelCoord = dispatchThreadId.xy;
+    float2 texSize = _SSGIIndirectTextureSizes.xy;
+    
+    if (any(pixelCoord >= (uint2)texSize))
+        return;
+    
+    float2 uv = (pixelCoord + 0.5) * _SSGIIndirectTextureSizes.zw;
+    
+    // Copy depth
+    float depth = _CameraDepthTexture.SampleLevel(sampler_PointClamp, uv, 0);
+    _HistoryDepthOutput[pixelCoord] = depth;
+    
+    // Copy indirect diffuse
+    float4 indirectDiffuse = _IndirectDiffuseTexture.SampleLevel(sampler_PointClamp, uv, 0);
+    _HistoryIndirectOutput[pixelCoord] = indirectDiffuse;
+    
+    // Copy sample count
+    float sampleCount = _SSGISampleTexture.SampleLevel(sampler_PointClamp, uv, 0);
+    _HistorySampleOutput[pixelCoord] = sampleCount;
+}

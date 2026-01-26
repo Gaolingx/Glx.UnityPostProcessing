@@ -1,0 +1,227 @@
+#pragma kernel CSCombineGI
+#pragma kernel CSCopyHistoryDepth
+#pragma kernel CSCopyHistoryColor
+
+#pragma multi_compile _ _GBUFFER_NORMALS_OCT
+#pragma multi_compile _ _USE_RENDERING_LAYERS
+#pragma multi_compile _ _DEPTH_NORMALS_UPSCALE
+
+#include "SSGICommon.hlsl"
+
+#if defined(_USE_RENDERING_LAYERS)
+    Texture2D<uint> _RenderingLayersTexture;
+#endif
+
+//=============================================================================
+// Depth-aware upscaling helpers
+//=============================================================================
+float3 DepthNormalsUpscale(float2 uv, float depth)
+{
+    float2 offset = _SSGIIndirectTextureSizes.zw;
+    float2 offsetUV = uv - float2(0, offset.y);
+    
+    float3 centerNormal = DecodeNormalFromGBuffer(_GBuffer2.SampleLevel(sampler_PointClamp, uv, 0).rgb);
+    float centerDepth = ConvertLinearEyeDepth(depth);
+    
+    float2 uv0 = offsetUV + float2(0, offset.y);
+    float2 uv1 = offsetUV + offset;
+    float2 uv2 = offsetUV + float2(offset.x, 0);
+    float2 uv3 = offsetUV;
+    
+    // Sample neighbor depths
+    float4 neighborDepth = float4(
+        _CameraDepthTexture.SampleLevel(sampler_PointClamp, uv0, 0),
+        _CameraDepthTexture.SampleLevel(sampler_PointClamp, uv1, 0),
+        _CameraDepthTexture.SampleLevel(sampler_PointClamp, uv2, 0),
+        _CameraDepthTexture.SampleLevel(sampler_PointClamp, uv3, 0)
+    );
+    
+#if !UNITY_REVERSED_Z
+    neighborDepth = lerp(UNITY_NEAR_CLIP_VALUE, 1, neighborDepth);
+#endif
+    
+    neighborDepth = float4(
+        ConvertLinearEyeDepth(neighborDepth.x),
+        ConvertLinearEyeDepth(neighborDepth.y),
+        ConvertLinearEyeDepth(neighborDepth.z),
+        ConvertLinearEyeDepth(neighborDepth.w)
+    );
+    
+    // Sample neighbor normals
+    float3 normal0 = DecodeNormalFromGBuffer(_GBuffer2.SampleLevel(sampler_PointClamp, uv0, 0).rgb);
+    float3 normal1 = DecodeNormalFromGBuffer(_GBuffer2.SampleLevel(sampler_PointClamp, uv1, 0).rgb);
+    float3 normal2 = DecodeNormalFromGBuffer(_GBuffer2.SampleLevel(sampler_PointClamp, uv2, 0).rgb);
+    float3 normal3 = DecodeNormalFromGBuffer(_GBuffer2.SampleLevel(sampler_PointClamp, uv3, 0).rgb);
+    
+    // Compute combined distance metric
+    float4 distances = abs(neighborDepth - centerDepth);
+    distances.x *= (1 - saturate(dot(normal0, centerNormal)));
+    distances.y *= (1 - saturate(dot(normal1, centerNormal)));
+    distances.z *= (1 - saturate(dot(normal2, centerNormal)));
+    distances.w *= (1 - saturate(dot(normal3, centerNormal)));
+    
+    // Find best match
+    float bestDist = min(min(distances.x, distances.y), min(distances.z, distances.w));
+    float2 bestUV = (bestDist == distances.x) ? uv0 :
+                    (bestDist == distances.y) ? uv1 :
+                    (bestDist == distances.z) ? uv2 : uv3;
+    
+    return _IndirectDiffuseTexture.SampleLevel(sampler_LinearClamp, bestUV, 0).rgb;
+}
+
+float3 DepthUpscale(float2 uv, float depth)
+{
+    float2 offset = _SSGIIndirectTextureSizes.zw;
+    float2 offsetUV = uv - float2(0, offset.y);
+    
+    float centerDepth = Linear01Depth(depth, _ZBufferParams);
+    
+    float2 uv0 = offsetUV + float2(0, offset.y);
+    float2 uv1 = offsetUV + offset;
+    float2 uv2 = offsetUV + float2(offset.x, 0);
+    float2 uv3 = offsetUV;
+    
+    float4 neighborDepth = float4(
+        _CameraDepthTexture.SampleLevel(sampler_PointClamp, uv0, 0),
+        _CameraDepthTexture.SampleLevel(sampler_PointClamp, uv1, 0),
+        _CameraDepthTexture.SampleLevel(sampler_PointClamp, uv2, 0),
+        _CameraDepthTexture.SampleLevel(sampler_PointClamp, uv3, 0)
+    );
+    
+#if !UNITY_REVERSED_Z
+    neighborDepth = lerp(UNITY_NEAR_CLIP_VALUE, 1, neighborDepth);
+#endif
+    
+    neighborDepth = float4(
+        Linear01Depth(neighborDepth.x, _ZBufferParams),
+        Linear01Depth(neighborDepth.y, _ZBufferParams),
+        Linear01Depth(neighborDepth.z, _ZBufferParams),
+        Linear01Depth(neighborDepth.w, _ZBufferParams)
+    );
+    
+    float4 distances = abs(neighborDepth - centerDepth);
+    
+    float bestDist = min(min(distances.x, distances.y), min(distances.z, distances.w));
+    float2 bestUV = (bestDist == distances.x) ? uv0 :
+                    (bestDist == distances.y) ? uv1 :
+                    (bestDist == distances.z) ? uv2 : uv3;
+    
+    const float depthThreshold = 0.01;
+    bool allClose = all(distances < depthThreshold);
+    
+    if (allClose)
+        return _IndirectDiffuseTexture.SampleLevel(sampler_LinearClamp, bestUV, 0).rgb;
+    else
+        return _IndirectDiffuseTexture.SampleLevel(sampler_PointClamp, uv, 0).rgb;
+}
+
+//=============================================================================
+// Combine GI with direct lighting (Pass 6 equivalent)
+//=============================================================================
+[numthreads(SSGI_TILE_SIZE, SSGI_TILE_SIZE, 1)]
+void CSCombineGI(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 pixelCoord = dispatchThreadId.xy;
+    float2 texSize = _SSGITextureSizes.xy;
+    
+    if (any(pixelCoord >= (uint2)texSize))
+        return;
+    
+    float2 uv = (pixelCoord + 0.5) * _SSGITextureSizes.zw;
+    
+    float depth = _CameraDepthTexture.SampleLevel(sampler_PointClamp, uv, 0);
+    
+#if !UNITY_REVERSED_Z
+    depth = lerp(UNITY_NEAR_CLIP_VALUE, 1, depth);
+#endif
+    
+    // Skip sky
+    if (IsBackground(depth))
+    {
+        _SSGIOutput[pixelCoord] = _SSGIInputTexture.SampleLevel(sampler_PointClamp, uv, 0);
+        return;
+    }
+    
+#if defined(_USE_RENDERING_LAYERS)
+    uint meshRenderingLayers = _RenderingLayersTexture.Load(int3(pixelCoord, 0));
+    if ((meshRenderingLayers & _IndirectDiffuseRenderingLayers) == 0)
+    {
+        _SSGIOutput[pixelCoord] = _SSGIInputTexture.SampleLevel(sampler_PointClamp, uv, 0);
+        return;
+    }
+#endif
+    
+    // Sample GBuffer for material info
+    float4 gbuffer0 = _GBuffer0.SampleLevel(sampler_PointClamp, uv, 0);
+    float4 gbuffer1 = _GBuffer1.SampleLevel(sampler_PointClamp, uv, 0);
+    
+    float3 albedo = gbuffer0.rgb;
+    uint materialFlags = UnpackMaterialFlags(gbuffer0.a);
+    float metallic = (materialFlags & kMaterialFlagSpecularSetup)
+        ? MetallicFromReflectivity(ReflectivitySpecular(gbuffer1.rgb))
+        : gbuffer1.r;
+    
+    // Sample indirect lighting with appropriate upscaling
+    float3 indirectLighting;
+    
+    if (_DownSample == 1.0)
+    {
+        indirectLighting = _IndirectDiffuseTexture.SampleLevel(sampler_PointClamp, uv, 0).rgb;
+    }
+    else
+    {
+#if defined(_DEPTH_NORMALS_UPSCALE)
+        indirectLighting = DepthNormalsUpscale(uv, depth);
+#else
+        indirectLighting = DepthUpscale(uv, depth);
+#endif
+    }
+    
+    // Apply material modulation
+    indirectLighting *= albedo * (1.0 - metallic);
+    
+    // Apply intensity multiplier
+    indirectLighting *= _IndirectDiffuseLightingMultiplier;
+    
+    // Sample direct lighting
+    float4 directLighting = _SSGIInputTexture.SampleLevel(sampler_PointClamp, uv, 0);
+    
+    // Combine
+    _SSGIOutput[pixelCoord] = float4(directLighting.rgb + indirectLighting, directLighting.a);
+}
+
+//=============================================================================
+// Copy History Depth (Pass 5 equivalent)
+//=============================================================================
+[numthreads(SSGI_TILE_SIZE, SSGI_TILE_SIZE, 1)]
+void CSCopyHistoryDepth(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 pixelCoord = dispatchThreadId.xy;
+    float2 texSize = _SSGIIndirectTextureSizes.xy;
+    
+    if (any(pixelCoord >= (uint2)texSize))
+        return;
+    
+    float2 uv = (pixelCoord + 0.5) * _SSGIIndirectTextureSizes.zw;
+    float depth = _CameraDepthTexture.SampleLevel(sampler_PointClamp, uv, 0);
+    
+    _HistoryDepthOutput[pixelCoord] = depth;
+}
+
+//=============================================================================
+// Copy History Color (Pass 9 equivalent)
+//=============================================================================
+[numthreads(SSGI_TILE_SIZE, SSGI_TILE_SIZE, 1)]
+void CSCopyHistoryColor(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 pixelCoord = dispatchThreadId.xy;
+    float2 texSize = _SSGIIndirectTextureSizes.xy;
+    
+    if (any(pixelCoord >= (uint2)texSize))
+        return;
+    
+    float2 uv = (pixelCoord + 0.5) * _SSGIIndirectTextureSizes.zw;
+    float4 color = _CameraColorTexture.SampleLevel(sampler_PointClamp, uv, 0);
+    
+    _HistoryColorOutput[pixelCoord] = color;
+}
