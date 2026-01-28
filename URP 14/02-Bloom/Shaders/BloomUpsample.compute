@@ -1,86 +1,26 @@
 // BloomUpsample.compute
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Filtering.hlsl"
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+
+#pragma only_renderers d3d11 playstation xboxone xboxseries vulkan metal switch
+
 #pragma kernel KMain
 
-#pragma multi_compile_local LOW_QUALITY HIGH_QUALITY
-
-#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#pragma multi_compile LOW_QUALITY HIGH_QUALITY
 
 Texture2D<float4> _InputLowTexture;
 Texture2D<float4> _InputHighTexture;
+
 RWTexture2D<float3> _OutputTexture;
+
 SamplerState sampler_LinearClamp;
 
-float4 _Params;             // x: scatter, yzw: unused
-float4 _BloomBicubicParams; // xy: low src size, zw: low src texel size
-float4 _TexelSize;          // xy: high src size, zw: high src texel size
+float4 _Params;                 // x: scatter, yzw: unused
+float4 _BloomBicubicParams;     // xy: low src size, zw: low src texel size
+float4 _TexelSize;              // xy; high src size, zw: high src texel size
 
-#define Scatter _Params.x
-
-// Bicubic sampling implementation
-float4 BicubicWeight(float x)
-{
-    float4 result;
-    float x2 = x * x;
-    float x3 = x2 * x;
-    
-    // Catmull-Rom spline weights
-    float4 c = float4(-0.5, 1.5, -1.5, 0.5);
-    float4 d = float4(1.0, -2.5, 2.0, -0.5);
-    float4 e = float4(-0.5, 0.0, 0.5, 0.0);
-    float4 f = float4(0.0, 1.0, 0.0, 0.0);
-    
-    result = c * x3 + d * x2 + e * x + f;
-    return result;
-}
-
-float3 SampleTextureBicubic(Texture2D<float4> tex, SamplerState samp, float2 uv, float4 texelSize)
-{
-    float2 texSize = texelSize.xy;
-    float2 invTexSize = texelSize.zw;
-    
-    float2 coord = uv * texSize - 0.5;
-    float2 frac_coord = frac(coord);
-    float2 index = coord - frac_coord;
-    
-    float4 xWeights = BicubicWeight(frac_coord.x);
-    float4 yWeights = BicubicWeight(frac_coord.y);
-    
-    // Optimized bicubic: reduce from 16 to 4 bilinear samples
-    // by combining weights
-    float4 xCombined = float4(xWeights.x + xWeights.y, xWeights.z + xWeights.w,
-                              xWeights.x + xWeights.y, xWeights.z + xWeights.w);
-    float4 yCombined = float4(yWeights.x + yWeights.y, yWeights.x + yWeights.y,
-                              yWeights.z + yWeights.w, yWeights.z + yWeights.w);
-    
-    float4 offset;
-    offset.x = xWeights.y / (xWeights.x + xWeights.y) - 1.0;
-    offset.y = yWeights.y / (yWeights.x + yWeights.y) - 1.0;
-    offset.z = xWeights.w / (xWeights.z + xWeights.w) + 1.0;
-    offset.w = yWeights.w / (yWeights.z + yWeights.w) + 1.0;
-    
-    float4 sampleWeights = xCombined * yCombined;
-    
-    float2 uv0 = (index + 0.5 + offset.xy) * invTexSize;
-    float2 uv1 = (index + 0.5 + offset.zy) * invTexSize;
-    float2 uv2 = (index + 0.5 + offset.xw) * invTexSize;
-    float2 uv3 = (index + 0.5 + offset.zw) * invTexSize;
-    
-    // Clamp UVs
-    float2 maxUV = 1.0 - invTexSize * 0.5;
-    uv0 = clamp(uv0, 0, maxUV);
-    uv1 = clamp(uv1, 0, maxUV);
-    uv2 = clamp(uv2, 0, maxUV);
-    uv3 = clamp(uv3, 0, maxUV);
-    
-    float3 s0 = tex.SampleLevel(samp, uv0, 0).xyz;
-    float3 s1 = tex.SampleLevel(samp, uv1, 0).xyz;
-    float3 s2 = tex.SampleLevel(samp, uv2, 0).xyz;
-    float3 s3 = tex.SampleLevel(samp, uv3, 0).xyz;
-    
-    float weightSum = sampleWeights.x + sampleWeights.y + sampleWeights.z + sampleWeights.w;
-    
-    return (s0 * sampleWeights.x + s1 * sampleWeights.y + s2 * sampleWeights.z + s3 * sampleWeights.w) / weightSum;
-}
+#define Scatter     _Params.x
 
 #define GROUP_SIZE 8
 
@@ -89,20 +29,28 @@ void KMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
     float2 uv = (dispatchThreadId.xy + 0.5) * _TexelSize.zw;
     uv = clamp(uv, 0, 1.0 - _BloomBicubicParams.zw * 0.5);
-    
+
     uint2 highCoord = clamp(dispatchThreadId.xy, 0, uint2(_TexelSize.xy) - 1);
     float3 highRes = _InputHighTexture[highCoord].xyz;
 
 #if LOW_QUALITY
-    float3 lowRes = _InputLowTexture.SampleLevel(sampler_LinearClamp, uv, 0.0).xyz;
+    float3 lowRes = SAMPLE_TEXTURE2D_X_LOD(_InputLowTexture, sampler_LinearClamp, uv, 0.0).xyz;
 #else // HIGH_QUALITY
-    float3 lowRes = SampleTextureBicubic(_InputLowTexture, sampler_LinearClamp, uv, _BloomBicubicParams);
+    float2 maxCoord = (1.0f - _TexelSize.zw) * _RTHandlePostProcessScale.xy;
+    float3 lowRes = SampleTexture2DBicubic(
+        TEXTURE2D_X_ARGS(_InputLowTexture, 
+        sampler_LinearClamp), 
+        uv, 
+        _BloomBicubicParams, 
+        (1.0).xx, 
+        unity_StereoEyeIndex
+    ).xyz;
 #endif
 
     float3 output = lerp(highRes, lowRes, Scatter);
 
     // Guard bands
-    output *= all(dispatchThreadId.xy < uint2(_TexelSize.xy));
+    output *= all(dispatchThreadId.xy <= uint2(_TexelSize.xy));
 
     _OutputTexture[dispatchThreadId.xy] = output;
 }
