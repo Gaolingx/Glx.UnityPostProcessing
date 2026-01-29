@@ -1,8 +1,10 @@
 // BloomPrefilter.compute
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 #include "PostProcessDefines.hlsl"
 #include "BloomCommon.hlsl"
+#include "Core.hlsl"
 
 #pragma only_renderers d3d11 playstation xboxone xboxseries vulkan metal switch
 
@@ -11,29 +13,26 @@
 #pragma multi_compile LOW_QUALITY HIGH_QUALITY
 #pragma multi_compile _ ENABLE_ALPHA
 
-Texture2D<float4> _InputTexture;
+TEXTURE2D_X(_InputTexture);
 
-RWTexture2D<CTYPE> _OutputTexture;
+RW_TEXTURE2D_X(CTYPE, _OutputTexture);
 
-SamplerState sampler_LinearClamp;
+SAMPLER(sampler_LinearClamp);
 
-float4 _RTHandleScale;
-
-float4 _TexelSize;       // xy: size, zw: texel size
-float4 _BloomThreshold;  // x: threshold, y: threshold - knee, z: knee * 2, w: 0.25 / knee
-float _ClampMax;         // User controlled clamp to limit crazy high broken spec
+CBUFFER_START(cb0)
+    float4 _TexelSize;       // xy: size, zw: texel size
+    float4 _BloomThreshold;  // x: threshold, y: threshold - knee, z: knee * 2, w: 0.25 / knee
+    float _ClampMax;
+CBUFFER_END
 
 float3 SamplePrefilter(float2 uv, float2 offset, out float weight)
 {
-    CTYPE c = _InputTexture.SampleLevel(sampler_LinearClamp, uv + _TexelSize.zw * offset, 0).CTYPE_SWIZZLE;
+    CTYPE c = SAMPLE_TEXTURE2D_X_LOD(_InputTexture, sampler_LinearClamp, uv + _TexelSize.zw * offset, 0.0).CTYPE_SWIZZLE;
 #ifdef ENABLE_ALPHA
     // When alpha is enabled, regions with zero alpha should not generate any bloom / glow. Therefore we pre-multipy the color with the alpha channel here and the rest
     // of the computations remain float3. Still, when bloom is applied to the final image, bloom will still be spread on regions with zero alpha (see UberPost.compute)
     c.xyz *= c.w;
 #endif
-    // User controlled clamp to limit crazy high broken spec
-    c.rgb = min(c.rgb, _ClampMax);
-
     c.xyz = QuadraticThreshold(c.xyz, _BloomThreshold.x, _BloomThreshold.yzw);
 
     weight = 1.0 / (Luminance(c.xyz) + 1.0);
@@ -106,6 +105,9 @@ void KMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     output += PartialAverage(F, G, K, L, wF, wG, wK, wL) * 0.125;
     output += PartialAverage(G, H, L, M, wG, wH, wL, wM) * 0.125;
 #endif
+
+    // User controlled clamp to limit crazy high broken spec
+    output.rgb = min(output.rgb, _ClampMax);
 
     // Guard bands
     output *= all(dispatchThreadId.xy <= uint2(_TexelSize.xy));
