@@ -2,6 +2,16 @@
 #define SSGI_COMPUTE_CORE_INCLUDED
 
 // ================================= Macro Define ================================= //
+// Helper macros for XR
+
+#if defined(UNITY_STEREO_INSTANCING_ENABLED) || defined(UNITY_STEREO_MULTIVIEW_ENABLED)
+    #define COORD_TEXTURE2D_X(pixelCoord) uint3(pixelCoord, unity_StereoEyeIndex)
+    #define UNITY_XR_ASSIGN_VIEW_INDEX(viewIndex) unity_StereoEyeIndex = viewIndex
+#else
+    #define COORD_TEXTURE2D_X(pixelCoord) pixelCoord
+    #define UNITY_XR_ASSIGN_VIEW_INDEX(viewIndex)
+#endif
+
 // Helper macros to handle XR single-pass with Texture2DArray
 // With single-pass instancing, unity_StereoEyeIndex is used to select the eye in the current context.
 // Otherwise, the index is statically set to 0
