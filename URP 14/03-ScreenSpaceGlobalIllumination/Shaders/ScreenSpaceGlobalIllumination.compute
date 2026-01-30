@@ -1,0 +1,770 @@
+// ScreenSpaceGlobalIllumination.compute
+#pragma kernel CopyDirectLighting
+#pragma kernel SSGIRayMarching
+#pragma kernel TemporalReprojection
+#pragma kernel SpatialDenoise
+#pragma kernel TemporalStabilization
+#pragma kernel CopyHistoryDepth
+#pragma kernel CombineGI
+#pragma kernel CameraMotionVectors
+#pragma kernel PoissonDiskDenoise
+#pragma kernel BlitColorTexture
+
+// ============================================================================
+// Multi-compile variants
+// ============================================================================
+
+// GBuffer normal encoding
+#pragma multi_compile_local _ _GBUFFER_NORMALS_OCT
+
+// Backface textures for accurate thickness
+#pragma multi_compile_local _ _BACKFACE_TEXTURES
+
+// Raymarching fallback options
+#pragma multi_compile_local _ _RAYMARCHING_FALLBACK_SKY
+#pragma multi_compile_local _ _RAYMARCHING_FALLBACK_REFLECTION_PROBES
+
+// Forward+ reflection probe atlas
+#pragma multi_compile_local _ _FP_REFL_PROBE_ATLAS
+
+// Rendering layers support
+#pragma multi_compile_local _ _USE_RENDERING_LAYERS
+
+// High quality upscaling
+#pragma multi_compile_local _ _DEPTH_NORMALS_UPSCALE
+
+// APV (Adaptive Probe Volume) support - Unity 2023.1+
+#if UNITY_VERSION >= 202310
+#pragma multi_compile_local _ PROBE_VOLUMES_L1 PROBE_VOLUMES_L2
+#pragma multi_compile_local _ _APV_LIGHTING_BUFFER
+#endif
+
+// ============================================================================
+// Includes
+// ============================================================================
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/CommonLighting.hlsl"
+
+#include "./SSGIComputeInput.hlsl"
+#include "./SSGIComputeUtilities.hlsl"
+#include "./SSGIComputeDenoise.hlsl"
+#include "./SSGIComputeRayMarching.hlsl"
+
+// ============================================================================
+// Thread group configuration
+// ============================================================================
+
+#define SSGI_THREAD_GROUP_SIZE_X 8
+#define SSGI_THREAD_GROUP_SIZE_Y 8
+
+// ============================================================================
+// Kernel 0: Copy Direct Lighting
+// ============================================================================
+
+[numthreads(SSGI_THREAD_GROUP_SIZE_X, SSGI_THREAD_GROUP_SIZE_Y, 1)]
+void CopyDirectLighting(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(dispatchThreadId.z);
+    
+    uint2 pixelCoord = dispatchThreadId.xy;
+    
+    // Bounds check
+    if (any(pixelCoord >= uint2(_ScreenSize.xy)))
+        return;
+    
+    float2 screenUV = (pixelCoord + 0.5) * _ScreenSize.zw;
+    
+    float depth = LOAD_TEXTURE2D_X(_CameraDepthTexture, pixelCoord).r;
+    
+#if !UNITY_REVERSED_Z
+    depth = lerp(UNITY_NEAR_CLIP_VALUE, 1, depth);
+#endif
+    
+    float4 directLighting = LOAD_TEXTURE2D_X(_SourceTexture, pixelCoord);
+    
+#if defined(PROBE_VOLUMES_L1) || defined(PROBE_VOLUMES_L2)
+    float3 apvLighting = float3(0.0, 0.0, 0.0);
+#endif
+    
+    // If the current pixel is sky
+    bool isBackground = abs(depth - UNITY_RAW_FAR_CLIP_VALUE) < RAW_FAR_CLIP_THRESHOLD;
+    
+    if (!isBackground)
+    {
+        UpdateAmbientSH();
+        
+        half4 gbuffer0 = LOAD_TEXTURE2D_X(_GBuffer0, pixelCoord);
+        half3 albedo = gbuffer0.rgb;
+        half4 normalSmoothness = LOAD_TEXTURE2D_X(_GBuffer2, pixelCoord);
+        
+#if defined(_GBUFFER_NORMALS_OCT)
+        half2 remappedOctNormalWS = half2(Unpack888ToFloat2(normalSmoothness.xyz));
+        half2 octNormalWS = remappedOctNormalWS.xy * half(2.0) - half(1.0);
+        normalSmoothness.xyz = half3(UnpackNormalOctQuadEncode(octNormalWS));
+#endif
+        
+        half4 gbuffer1 = LOAD_TEXTURE2D_X(_GBuffer1, pixelCoord);
+        half metallic = (gbuffer0.a == kMaterialFlagSpecularSetup) ? 
+            MetallicFromReflectivity(ReflectivitySpecular(gbuffer1.rgb)) : gbuffer1.r;
+        
+#if defined(PROBE_VOLUMES_L1) || defined(PROBE_VOLUMES_L2)
+        float3 positionWS = ComputeWorldSpacePosition(screenUV, depth, UNITY_MATRIX_I_VP);
+        half3 viewDirectionWS = IsPerspectiveProjection() ? 
+            normalize(GetCameraPositionWS() - positionWS) : normalize(UNITY_MATRIX_V[2].xyz);
+        half4 probeOcclusion = half4(1.0, 1.0, 1.0, 1.0);
+        apvLighting = SSGISampleProbeVolumePixel(positionWS, normalSmoothness.xyz, 
+            viewDirectionWS, screenUV, probeOcclusion);
+        apvLighting *= probeOcclusion.rgb;
+        
+        half3 ambientLighting = apvLighting * albedo * (1.0 - metallic);
+#else
+        half3 ambientLighting = SSGIEvaluateAmbientProbeSRGB(normalSmoothness.xyz) * albedo * (1.0 - metallic);
+#endif
+        
+        directLighting.rgb = max(directLighting.rgb - ambientLighting, half3(0.0, 0.0, 0.0));
+        
+        // Prevent artifacts from precision errors
+        half luminanceFactor = saturate(Luminance(directLighting.rgb) * rcp(0.04));
+        directLighting.rgb = lerp(half3(0.0, 0.0, 0.0), directLighting.rgb, luminanceFactor);
+    }
+    
+    _RW_IntermediateCameraColorTexture[COORD_TEXTURE2D_X(pixelCoord)] = directLighting;
+    
+#if defined(PROBE_VOLUMES_L1) || defined(PROBE_VOLUMES_L2)
+    _RW_APVLightingTexture[COORD_TEXTURE2D_X(pixelCoord)] = float4(apvLighting, 1.0);
+#endif
+}
+
+// ============================================================================
+// Kernel 1: SSGI Ray Marching
+// ============================================================================
+
+[numthreads(SSGI_THREAD_GROUP_SIZE_X, SSGI_THREAD_GROUP_SIZE_Y, 1)]
+void SSGIRayMarching(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(dispatchThreadId.z);
+    
+    uint2 pixelCoord = dispatchThreadId.xy;
+    float2 targetSize = _SSGITextureSize.xy;
+    
+    // Bounds check for potentially lower resolution
+    if (any(pixelCoord >= uint2(targetSize)))
+        return;
+    
+    float2 screenUV = (pixelCoord + 0.5) * _SSGITextureSize.zw;
+    half4 lightingDistance = half4(0.0, 0.0, 0.0, 0.0);
+    
+    float depth = SAMPLE_TEXTURE2D_X_LOD(_CameraDepthTexture, sampler_PointClamp, screenUV, 0).r;
+    
+    // If the current pixel is sky, discard
+    bool isBackground = abs(depth - UNITY_RAW_FAR_CLIP_VALUE) < RAW_FAR_CLIP_THRESHOLD;
+    
+    if (isBackground)
+    {
+        // Keep previous value for border filling at low resolution
+        return;
+    }
+    
+#if !UNITY_REVERSED_Z
+    depth = lerp(UNITY_NEAR_CLIP_VALUE, 1, depth);
+#endif
+    
+    float3 positionWS = ComputeWorldSpacePosition(screenUV, depth, UNITY_MATRIX_I_VP);
+    float3 cameraPositionWS = GetCameraPositionWS();
+    half3 viewDirectionWS = IsPerspectiveProjection() ? 
+        normalize(cameraPositionWS - positionWS) : normalize(UNITY_MATRIX_V[2].xyz);
+    
+    half2 velocity = SAMPLE_TEXTURE2D_X_LOD(_MotionVectorTexture, sampler_LinearClamp, screenUV, 0).xy;
+    float2 prevUV = screenUV - velocity;
+    
+    half4 normalSmoothness = SAMPLE_TEXTURE2D_X_LOD(_GBuffer2, sampler_PointClamp, screenUV, 0);
+    
+#if defined(_GBUFFER_NORMALS_OCT)
+    half2 remappedOctNormalWS = half2(Unpack888ToFloat2(normalSmoothness.xyz));
+    half2 octNormalWS = remappedOctNormalWS.xy * half(2.0) - half(1.0);
+    normalSmoothness.xyz = half3(UnpackNormalOctQuadEncode(octNormalWS));
+#endif
+    
+    // Compute reprojection validity
+    half maxRadius = ComputeMaxReprojectionWorldRadius(positionWS, viewDirectionWS, 
+        normalSmoothness.xyz, _PixelSpreadAngleTangent);
+    float prevDeviceDepth = SAMPLE_TEXTURE2D_X_LOD(_SSGIHistoryDepthTexture, sampler_PointClamp, prevUV, 0).r;
+    
+#if !UNITY_REVERSED_Z
+    prevDeviceDepth = lerp(UNITY_NEAR_CLIP_VALUE, 1, prevDeviceDepth);
+#endif
+    
+    float3 prevPositionWS = ComputeWorldSpacePosition(prevUV, prevDeviceDepth, _PrevInvViewProjMatrix);
+    half radius = length(prevPositionWS - positionWS) / maxRadius;
+    
+    bool canBeReprojected = (prevUV.x <= 1.0 && prevUV.x >= 0.0 && 
+                             prevUV.y <= 1.0 && prevUV.y >= 0.0 && 
+                             radius <= 1.0 && _HistoryTextureValid > 0);
+    
+    // Initialize ray marching parameters
+    SSGIRayMarchParams params = InitializeRayMarchParams();
+    
+    // If reprojection fails, increase samples and reduce quality
+    if (!canBeReprojected && _TemporalIntensity != 0.0)
+    {
+        params.maxSteps = 8;
+        params.maxSmallSteps = 0;
+        params.maxMediumSteps = 4;
+        params.stepSize = 0.6;
+        params.mediumStepSize = 0.075;
+        params.rayCount = max(4, params.rayCount);
+    }
+    
+    Ray ray;
+    ray.position = cameraPositionWS;
+    ray.direction = -viewDirectionWS;
+    
+    RayHit screenHit = InitializeRayHit();
+    screenHit.distance = length(cameraPositionWS - positionWS);
+    screenHit.position = positionWS;
+    screenHit.normal = normalSmoothness.xyz;
+    
+    half dither = (GenerateRandomValue(screenUV) * 0.3 - 0.15);
+    half sampleWeight = rcp((half)params.rayCount);
+    
+    for (int i = 0; i < params.rayCount; i++)
+    {
+        RayHit rayHit = screenHit;
+        
+        ray.direction = SampleHemisphereCosine(GenerateRandomValue(screenUV), 
+            GenerateRandomValue(screenUV), rayHit.normal);
+        ray.position = rayHit.position;
+        
+        rayHit = RayMarching(ray, screenUV, dither, viewDirectionWS, params);
+        
+        bool hitSuccessful = rayHit.distance > REAL_EPS;
+        
+        UNITY_BRANCH
+        if (hitSuccessful)
+        {
+            lightingDistance.rgb += rayHit.emission * sampleWeight;
+            lightingDistance.a += rayHit.distance * sampleWeight;
+        }
+        else
+        {
+            lightingDistance.rgb += SampleReflectionProbes(ray.direction, positionWS, 1.0h, screenUV) * sampleWeight;
+            lightingDistance.a += sampleWeight;
+        }
+    }
+    
+    // Clamp brightness to reduce fireflies
+    lightingDistance.xyz = RgbToHsv(lightingDistance.xyz);
+    lightingDistance.z = clamp(lightingDistance.z, 0.0, _MaxBrightness);
+    lightingDistance.xyz = HsvToRgb(lightingDistance.xyz);
+    
+    // Encode reprojection validity in sign of distance
+    lightingDistance.w = canBeReprojected ? lightingDistance.w : -lightingDistance.w;
+    
+    _RW_IntermediateIndirectDiffuseTexture[COORD_TEXTURE2D_X(pixelCoord)] = lightingDistance;
+}
+
+// ============================================================================
+// Kernel 2: Temporal Reprojection
+// ============================================================================
+
+[numthreads(SSGI_THREAD_GROUP_SIZE_X, SSGI_THREAD_GROUP_SIZE_Y, 1)]
+void TemporalReprojection(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(dispatchThreadId.z);
+    
+    uint2 pixelCoord = dispatchThreadId.xy;
+    float2 targetSize = _SSGITextureSize.xy;
+    
+    if (any(pixelCoord >= uint2(targetSize)))
+        return;
+    
+    float2 screenUV = (pixelCoord + 0.5) * _SSGITextureSize.zw;
+    
+    half2 velocity = SAMPLE_TEXTURE2D_X_LOD(_MotionVectorTexture, sampler_LinearClamp, screenUV, 0).xy;
+    float2 prevUV = screenUV - velocity;
+    
+    float deviceDepth = SAMPLE_TEXTURE2D_X_LOD(_CameraDepthTexture, sampler_PointClamp, screenUV, 0).r;
+    
+    half4 currentColor = SAMPLE_TEXTURE2D_X_LOD(_IntermediateIndirectDiffuseTexture, sampler_LinearClamp, screenUV, 0);
+    half historySample = SAMPLE_TEXTURE2D_X_LOD(_SSGIHistorySampleTexture, sampler_PointClamp, prevUV, 0).r;
+    
+    // Extract reprojection validity
+    bool canBeReprojected = FastSign(currentColor.a) == 1.0;
+    currentColor.a = abs(currentColor.a);
+    
+    bool isSky = abs(deviceDepth - UNITY_RAW_FAR_CLIP_VALUE) < RAW_FAR_CLIP_THRESHOLD;
+    canBeReprojected = isSky || historySample == 0.0 ? false : canBeReprojected;
+    
+    half3 prevColor = SAMPLE_TEXTURE2D_X_LOD(_HistoryIndirectDiffuseTexture, sampler_LinearClamp, prevUV, 0).rgb;
+    
+    half accumulationFactor = (historySample >= MAX_ACCUM_FRAME_NUM ? 
+        _TemporalIntensity : (historySample / (historySample + 1.0)));
+    
+    half sampleCount = clamp(historySample + 1.0, 0.0, MAX_ACCUM_FRAME_NUM);
+    
+    half3 result;
+    
+    UNITY_BRANCH
+    if (canBeReprojected)
+    {
+        result = currentColor.rgb * (1.0 - accumulationFactor) + prevColor.rgb * accumulationFactor;
+    }
+    else if (_AggressiveDenoise > 0)
+    {
+        half3 boxMax = currentColor.rgb;
+        half3 boxMin = currentColor.rgb;
+        half3 moment1 = currentColor.rgb;
+        half3 moment2 = currentColor.rgb * currentColor.rgb;
+        
+        AdjustColorBox(boxMin, boxMax, moment1, moment2, screenUV, 0.0, -1.0, 
+            _IntermediateIndirectDiffuseTexture, sampler_PointClamp, _SSGITextureSize.zw);
+        AdjustColorBox(boxMin, boxMax, moment1, moment2, screenUV, -1.0, 0.0, 
+            _IntermediateIndirectDiffuseTexture, sampler_PointClamp, _SSGITextureSize.zw);
+        AdjustColorBox(boxMin, boxMax, moment1, moment2, screenUV, 1.0, 0.0, 
+            _IntermediateIndirectDiffuseTexture, sampler_PointClamp, _SSGITextureSize.zw);
+        AdjustColorBox(boxMin, boxMax, moment1, moment2, screenUV, 0.0, 1.0, 
+            _IntermediateIndirectDiffuseTexture, sampler_PointClamp, _SSGITextureSize.zw);
+        
+        prevColor = clamp(prevColor, boxMin, boxMax);
+        result = currentColor.rgb * (1.0 - accumulationFactor) + prevColor.rgb * accumulationFactor;
+    }
+    else
+    {
+        result = currentColor.rgb;
+        sampleCount = 1.0;
+    }
+    
+    _RW_IndirectDiffuseTexture[COORD_TEXTURE2D_X(pixelCoord)] = half4(result, currentColor.a);
+    _RW_SSGISampleTexture[COORD_TEXTURE2D_X(pixelCoord)] = sampleCount;
+}
+
+// ============================================================================
+// Kernel 3: Edge-Avoiding Spatial Denoise (A-Trous Wavelet)
+// ============================================================================
+
+[numthreads(SSGI_THREAD_GROUP_SIZE_X, SSGI_THREAD_GROUP_SIZE_Y, 1)]
+void SpatialDenoise(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(dispatchThreadId.z);
+    
+    uint2 pixelCoord = dispatchThreadId.xy;
+    float2 targetSize = _SSGITextureSize.xy;
+    
+    if (any(pixelCoord >= uint2(targetSize)))
+        return;
+    
+    float2 screenUV = (pixelCoord + 0.5) * _SSGITextureSize.zw;
+    
+    float centerDepth = SAMPLE_TEXTURE2D_X_LOD(_CameraDepthTexture, sampler_PointClamp, screenUV, 0).r;
+    
+    bool isBackground = abs(centerDepth - UNITY_RAW_FAR_CLIP_VALUE) < RAW_FAR_CLIP_THRESHOLD;
+    
+    if (isBackground)
+        return;
+    
+#if !UNITY_REVERSED_Z
+    centerDepth = lerp(UNITY_NEAR_CLIP_VALUE, 1, centerDepth);
+#endif
+    
+    centerDepth = ConvertLinearEyeDepth(centerDepth);
+    
+    half4 colorDistance = SAMPLE_TEXTURE2D_X_LOD(_SourceDiffuseTexture, sampler_PointClamp, screenUV, 0);
+    half3 centerColor = colorDistance.rgb;
+    half hitDistance = colorDistance.a;
+    
+    // Dynamic dilation rate
+    half blurAmount = hitDistance < 1.0 && _HistoryTextureValid > 0 ? 0.05 : 1.0;
+    
+    half minRange = max(2.0 * _DownSample, 2.0);
+    half maxRange = max(5.0 * _DownSample, minRange + 4.0);
+    
+    half random = GenerateHashedRandomFloat(uint3(screenUV * _SSGITextureSize.xy, 1));
+    float2 intensity = floor(lerp(minRange, maxRange, random)) * _SSGITextureSize.zw;
+    
+    // 3x3 gaussian kernel offsets (excluding center)
+    static const half2 offset[8] = {
+        half2(-1.0, -1.0), half2(0.0, -1.0), half2(1.0, -1.0),
+        half2(-1.0, 0.0), half2(1.0, 0.0),
+        half2(-1.0, 1.0), half2(0.0, 1.0), half2(1.0, 1.0)
+    };
+    
+    // 3x3 approximate gaussian kernel (excluding center)
+    static const half kernel[8] = {
+        half(0.0625), half(0.125), half(0.0625),
+        half(0.125), half(0.125),
+        half(0.0625), half(0.125), half(0.0625)
+    };
+    
+    half3 centerNormal = SAMPLE_TEXTURE2D_X_LOD(_GBuffer2, sampler_PointClamp, screenUV, 0).rgb;
+    
+#if defined(_GBUFFER_NORMALS_OCT)
+    half2 remappedOctNormalWS = half2(Unpack888ToFloat2(centerNormal));
+    half2 octNormalWS = remappedOctNormalWS.xy * half(2.0) - half(1.0);
+    centerNormal = half3(UnpackNormalOctQuadEncode(octNormalWS));
+#endif
+    
+    half sumWeight = 0.25;
+    half3 sumColor = centerColor * sumWeight;
+    
+    UNITY_UNROLL
+    for (uint i = 0; i < 8; i++)
+    {
+        float2 uv = saturate(screenUV + offset[i] * intensity);
+        
+        half3 color = SAMPLE_TEXTURE2D_X_LOD(_SourceDiffuseTexture, sampler_PointClamp, uv, 0).rgb;
+        half3 normal = SAMPLE_TEXTURE2D_X_LOD(_GBuffer2, sampler_PointClamp, uv, 0).rgb;
+        
+#if defined(_GBUFFER_NORMALS_OCT)
+        half2 remappedOctNormalWS = half2(Unpack888ToFloat2(normal));
+        half2 octNormalWS = remappedOctNormalWS.xy * half(2.0) - half(1.0);
+        normal = half3(UnpackNormalOctQuadEncode(octNormalWS));
+#endif
+        
+        half3 diff = centerNormal - normal;
+        half distance = max(dot(diff, diff), 0.0);
+        half normalWeight = min(exp(-distance * 20.0), 1.0);
+        
+        float depth = SAMPLE_TEXTURE2D_X_LOD(_CameraDepthTexture, sampler_PointClamp, uv, 0).r;
+        
+#if !UNITY_REVERSED_Z
+        depth = lerp(UNITY_NEAR_CLIP_VALUE, 1, depth);
+#endif
+        
+        depth = ConvertLinearEyeDepth(depth);
+        
+        diff.x = centerDepth - depth;
+        distance = dot(diff.x, diff.x);
+        half depthWeight = min(exp(-distance), 1.0);
+        
+        half weight = normalWeight * depthWeight * kernel[i];
+        
+        sumColor += color * weight;
+        sumWeight += weight;
+    }
+    
+    half4 result = half4(lerp(centerColor, sumColor * rcp(sumWeight), blurAmount), hitDistance);
+    _RW_IntermediateIndirectDiffuseTexture[COORD_TEXTURE2D_X(pixelCoord)] = result;
+}
+
+// ============================================================================
+// Kernel 4: Temporal Stabilization
+// ============================================================================
+
+[numthreads(SSGI_THREAD_GROUP_SIZE_X, SSGI_THREAD_GROUP_SIZE_Y, 1)]
+void TemporalStabilization(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(dispatchThreadId.z);
+    
+    uint2 pixelCoord = dispatchThreadId.xy;
+    float2 targetSize = _SSGITextureSize.xy;
+    
+    if (any(pixelCoord >= uint2(targetSize)))
+        return;
+    
+    float2 screenUV = (pixelCoord + 0.5) * _SSGITextureSize.zw;
+    
+    half4 indirectDiffuse = SAMPLE_TEXTURE2D_X_LOD(_SourceDiffuseTexture, sampler_PointClamp, screenUV, 0);
+    half3 colorCenter = indirectDiffuse.xyz;
+    
+    half2 velocity = SAMPLE_TEXTURE2D_X_LOD(_MotionVectorTexture, sampler_LinearClamp, screenUV, 0).xy;
+    float2 prevUV = screenUV - velocity;
+    
+    float deviceDepth = SAMPLE_TEXTURE2D_X_LOD(_CameraDepthTexture, sampler_PointClamp, screenUV, 0).r;
+    
+    bool isSky = abs(deviceDepth - UNITY_RAW_FAR_CLIP_VALUE) < RAW_FAR_CLIP_THRESHOLD;
+    
+    if (isSky || prevUV.x > 1.0 || prevUV.x < 0.0 || prevUV.y > 1.0 || prevUV.y < 0.0)
+        return;
+    
+    // Color variance for AABB clamping
+    half3 boxMax = colorCenter;
+    half3 boxMin = colorCenter;
+    half3 moment1 = colorCenter;
+    half3 moment2 = colorCenter * colorCenter;
+    
+    AdjustColorBox(boxMin, boxMax, moment1, moment2, screenUV, 0.0, -1.0, 
+        _SourceDiffuseTexture, sampler_PointClamp, _SSGITextureSize.zw);
+    AdjustColorBox(boxMin, boxMax, moment1, moment2, screenUV, -1.0, 0.0, 
+        _SourceDiffuseTexture, sampler_PointClamp, _SSGITextureSize.zw);
+    AdjustColorBox(boxMin, boxMax, moment1, moment2, screenUV, 1.0, 0.0, 
+        _SourceDiffuseTexture, sampler_PointClamp, _SSGITextureSize.zw);
+    AdjustColorBox(boxMin, boxMax, moment1, moment2, screenUV, 0.0, 1.0, 
+        _SourceDiffuseTexture, sampler_PointClamp, _SSGITextureSize.zw);
+    
+    half3 prevColor = SAMPLE_TEXTURE2D_X_LOD(_HistoryIndirectDiffuseTexture, sampler_LinearClamp, prevUV, 0).rgb;
+    prevColor = clamp(prevColor, boxMin, boxMax);
+    
+    half intensity = saturate(min(_TemporalIntensity - abs(velocity.x) * _TemporalIntensity, 
+                                  _TemporalIntensity - abs(velocity.y) * _TemporalIntensity));
+    
+    half3 finalColor = lerp(colorCenter, prevColor, intensity * _HistoryTextureValid);
+    
+    _RW_IndirectDiffuseTexture[COORD_TEXTURE2D_X(pixelCoord)] = half4(finalColor, indirectDiffuse.w);
+}
+
+// ============================================================================
+// Kernel 5: Copy History Depth
+// ============================================================================
+
+[numthreads(SSGI_THREAD_GROUP_SIZE_X, SSGI_THREAD_GROUP_SIZE_Y, 1)]
+void CopyHistoryDepth(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(dispatchThreadId.z);
+    
+    uint2 pixelCoord = dispatchThreadId.xy;
+    float2 targetSize = _SSGITextureSize.xy;
+    
+    if (any(pixelCoord >= uint2(targetSize)))
+        return;
+    
+    float2 screenUV = (pixelCoord + 0.5) * _SSGITextureSize.zw;
+    
+    float depth = SAMPLE_TEXTURE2D_X_LOD(_CameraDepthTexture, sampler_PointClamp, screenUV, 0).r;
+    
+    _RW_SSGIHistoryDepthTexture[COORD_TEXTURE2D_X(pixelCoord)] = depth;
+}
+
+// ============================================================================
+// Kernel 6: Combine GI
+// ============================================================================
+
+[numthreads(SSGI_THREAD_GROUP_SIZE_X, SSGI_THREAD_GROUP_SIZE_Y, 1)]
+void CombineGI(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(dispatchThreadId.z);
+    
+    uint2 pixelCoord = dispatchThreadId.xy;
+    
+    if (any(pixelCoord >= uint2(_ScreenSize.xy)))
+        return;
+    
+    float2 screenUV = (pixelCoord + 0.5) * _ScreenSize.zw;
+    
+    float depth = SAMPLE_TEXTURE2D_X_LOD(_CameraDepthTexture, sampler_PointClamp, screenUV, 0).r;
+#if !UNITY_REVERSED_Z
+    depth = lerp(UNITY_NEAR_CLIP_VALUE, 1, depth);
+#endif
+    
+    // 读取直接光照（包含 Skybox）
+    half4 directLighting = SAMPLE_TEXTURE2D_X_LOD(_IntermediateCameraColorTexture, sampler_PointClamp, screenUV, 0);
+    bool isBackground = abs(depth - UNITY_RAW_FAR_CLIP_VALUE) < RAW_FAR_CLIP_THRESHOLD;
+    
+    if (isBackground)
+    {
+        // [修复] 对于 Skybox 像素，直接写入原始颜色，确保 Skybox 被正确复制
+        _RW_CameraColorTexture[COORD_TEXTURE2D_X(pixelCoord)] = directLighting;
+        return;
+    }
+    
+#if defined(_USE_RENDERING_LAYERS)
+    uint meshRenderingLayers = SampleSceneRenderingLayer(screenUV);
+    if (!IsMatchingLightLayer(_IndirectDiffuseRenderingLayers, meshRenderingLayers))
+        return;
+#endif
+    
+    half4 gbuffer0 = SAMPLE_TEXTURE2D_X_LOD(_GBuffer0, sampler_PointClamp, screenUV, 0);
+    half4 gbuffer1 = SAMPLE_TEXTURE2D_X_LOD(_GBuffer1, sampler_PointClamp, screenUV, 0);
+    
+    half3 albedo = gbuffer0.rgb;
+    half metallic = (gbuffer0.a == kMaterialFlagSpecularSetup) ? 
+        MetallicFromReflectivity(ReflectivitySpecular(gbuffer1.rgb)) : gbuffer1.r;
+    
+    half3 indirectLighting;
+    
+    UNITY_BRANCH
+    if (_DownSample == 1.0)
+    {
+        indirectLighting = SAMPLE_TEXTURE2D_X_LOD(_IndirectDiffuseTexture, sampler_PointClamp, screenUV, 0).rgb;
+    }
+    else
+    {
+#ifdef _DEPTH_NORMALS_UPSCALE
+        indirectLighting = DepthNormalsUpscale(screenUV, depth);
+#else
+        indirectLighting = DepthUpscale(screenUV, depth);
+#endif
+    }
+    
+    indirectLighting *= albedo * (1.0 - metallic);
+    indirectLighting *= _IndirectDiffuseLightingMultiplier;
+    
+    _RW_CameraColorTexture[COORD_TEXTURE2D_X(pixelCoord)] = half4(directLighting.rgb + indirectLighting, directLighting.a);
+}
+
+// ============================================================================
+// Kernel 7: Camera Motion Vectors (Editor Only)
+// ============================================================================
+
+[numthreads(SSGI_THREAD_GROUP_SIZE_X, SSGI_THREAD_GROUP_SIZE_Y, 1)]
+void CameraMotionVectors(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(dispatchThreadId.z);
+    
+    uint2 pixelCoord = dispatchThreadId.xy;
+    
+    if (any(pixelCoord >= uint2(_ScreenSize.xy)))
+        return;
+    
+    float2 screenUV = (pixelCoord + 0.5) * _ScreenSize.zw;
+    
+    float depth = SAMPLE_TEXTURE2D_X_LOD(_CameraDepthTexture, sampler_PointClamp, screenUV, 0).r;
+    
+#if !UNITY_REVERSED_Z
+    depth = lerp(UNITY_NEAR_CLIP_VALUE, 1, depth);
+#endif
+    
+    float3 posWS = ComputeWorldSpacePosition(screenUV, depth, UNITY_MATRIX_I_VP);
+    
+    float4 posCS = mul(_NonJitteredViewProjMatrix, float4(posWS, 1.0));
+    float4 prevPosCS = mul(_PrevViewProjMatrix, float4(posWS, 1.0));
+    
+    float2 posNDC = posCS.xy * rcp(posCS.w);
+    float2 prevPosNDC = prevPosCS.xy * rcp(prevPosCS.w);
+    
+    half2 velocity = (posNDC - prevPosNDC);
+    
+#if UNITY_UV_STARTS_AT_TOP
+    velocity.y = -velocity.y;
+#endif
+    
+    velocity.xy *= 0.5;
+    
+    _RW_MotionVectorTexture[COORD_TEXTURE2D_X(pixelCoord)] = float4(velocity, 0, 0);
+}
+
+// ============================================================================
+// Kernel 8: Poisson Disk Recurrent Denoise
+// ============================================================================
+
+[numthreads(SSGI_THREAD_GROUP_SIZE_X, SSGI_THREAD_GROUP_SIZE_Y, 1)]
+void PoissonDiskDenoise(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(dispatchThreadId.z);
+    
+    uint2 pixelCoord = dispatchThreadId.xy;
+    float2 targetSize = _SSGITextureSize.xy;
+    
+    if (any(pixelCoord >= uint2(targetSize)))
+        return;
+    
+    float2 screenUV = (pixelCoord + 0.5) * _SSGITextureSize.zw;
+    
+    float centerDepth = SAMPLE_TEXTURE2D_X_LOD(_CameraDepthTexture, sampler_PointClamp, screenUV, 0).r;
+    
+#if !UNITY_REVERSED_Z
+    centerDepth = lerp(UNITY_NEAR_CLIP_VALUE, 1, centerDepth);
+#endif
+    
+    bool isBackground = abs(centerDepth - UNITY_RAW_FAR_CLIP_VALUE) < RAW_FAR_CLIP_THRESHOLD;
+    
+    if (isBackground)
+        return;
+    
+    float3 positionWS = ComputeWorldSpacePosition(screenUV, centerDepth, UNITY_MATRIX_I_VP);
+    centerDepth = Linear01Depth(centerDepth, _ZBufferParams);
+    
+    half4 centerSignal = SAMPLE_TEXTURE2D_X_LOD(_SourceDiffuseTexture, sampler_PointClamp, screenUV, 0);
+    
+    float3 cameraPositionWS = GetCameraPositionWS();
+    half3 viewDirectionWS = IsPerspectiveProjection() ? 
+        normalize(cameraPositionWS - positionWS) : normalize(UNITY_MATRIX_V[2].xyz);
+    
+    half3 centerNormal = SAMPLE_TEXTURE2D_X_LOD(_GBuffer2, sampler_PointClamp, screenUV, 0).xyz;
+    
+#if defined(_GBUFFER_NORMALS_OCT)
+    half2 remappedOctNormalWS = half2(Unpack888ToFloat2(centerNormal.xyz));
+    half2 octNormalWS = remappedOctNormalWS.xy * half(2.0) - half(1.0);
+    centerNormal.xyz = half3(UnpackNormalOctQuadEncode(octNormalWS));
+#endif
+    
+    half4 dominantWS = GetSpecularDominantDirection(centerNormal, viewDirectionWS);
+    half blurRadius = _ReBlurDenoiserRadius;
+    
+    half2x3 TvBv = GetKernelBasis(dominantWS.xyz, centerNormal);
+    TvBv[0] *= blurRadius;
+    TvBv[1] *= blurRadius;
+    
+    float4 signalSum = 0.0;
+    float sumWeight = 0.0;
+    
+    UNITY_UNROLL
+    for (int sampleIndex = 0; sampleIndex < POISSON_SAMPLE_COUNT; ++sampleIndex)
+    {
+        half3 offset = k_PoissonDiskSamples[sampleIndex];
+        float2 uv = GetKernelSampleCoordinates(offset, positionWS, TvBv[0], TvBv[1], _ReBlurBlurRotator);
+        
+        bool isInScreen = uv.x <= 1.0 && uv.x >= 0.0 && uv.y <= 1.0 && uv.y >= 0.0;
+        if (!isInScreen)
+            continue;
+        
+        half depthWeight = 1.0;
+        half normalWeight = 1.0;
+        half planeWeight = 1.0;
+        
+        float sampleDepth = SAMPLE_TEXTURE2D_X_LOD(_CameraDepthTexture, sampler_PointClamp, uv, 0).r;
+        
+#if !UNITY_REVERSED_Z
+        sampleDepth = lerp(UNITY_NEAR_CLIP_VALUE, 1, sampleDepth);
+#endif
+        
+        float3 samplePositionWS = ComputeWorldSpacePosition(uv, sampleDepth, UNITY_MATRIX_I_VP);
+        sampleDepth = Linear01Depth(sampleDepth, _ZBufferParams);
+        
+        half3 sampleNormal = SAMPLE_TEXTURE2D_X_LOD(_GBuffer2, sampler_PointClamp, uv, 0).xyz;
+        
+#if defined(_GBUFFER_NORMALS_OCT)
+        half2 remappedOctNormalWS = half2(Unpack888ToFloat2(sampleNormal.xyz));
+        half2 octNormalWS = remappedOctNormalWS.xy * half(2.0) - half(1.0);
+        sampleNormal.xyz = half3(UnpackNormalOctQuadEncode(octNormalWS));
+#endif
+        
+        depthWeight = max(0.0, 1.0 - abs(sampleDepth - centerDepth));
+        
+        const half normalCloseness = sqr(sqr(max(0.0, dot(sampleNormal, centerNormal))));
+        const half normalError = 1.0 - normalCloseness;
+        normalWeight = max(0.0, (1.0 - normalError));
+        
+        const half3 dq = positionWS - samplePositionWS;
+        const half distance2 = dot(dq, dq);
+        const half planeError = max(abs(dot(dq, sampleNormal)), abs(dot(dq, centerNormal)));
+        
+        planeWeight = (distance2 < 0.0001) ? 1.0 : pow(max(0.0, 1.0 - 2.0 * planeError / sqrt(distance2)), 2.0);
+        
+        half w = k_GaussianWeight[sampleIndex];
+        w *= depthWeight * normalWeight * planeWeight;
+        w = (sampleDepth != 1.0) && isInScreen ? w : 0.0;
+        
+        float4 tapSignal = SAMPLE_TEXTURE2D_X_LOD(_SourceDiffuseTexture, sampler_PointClamp, uv, 0);
+        w = Luminance(tapSignal.xyz) > 0.0 ? w : 0.0;
+        tapSignal = w ? tapSignal : 0.0;
+        
+        signalSum += tapSignal * w;
+        sumWeight += w;
+    }
+    
+    signalSum = sumWeight != 0.0 ? signalSum / sumWeight : centerSignal;
+    
+    _RW_IntermediateIndirectDiffuseTexture[COORD_TEXTURE2D_X(pixelCoord)] = max(signalSum, half4(0.0, 0.0, 0.0, 0.0));
+}
+
+// ============================================================================
+// Kernel 9: Blit Color Texture
+// ============================================================================
+
+[numthreads(SSGI_THREAD_GROUP_SIZE_X, SSGI_THREAD_GROUP_SIZE_Y, 1)]
+void BlitColorTexture(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(dispatchThreadId.z);
+    
+    uint2 pixelCoord = dispatchThreadId.xy;
+    
+    if (any(pixelCoord >= uint2(_SSGITextureSize.xy)))
+        return;
+    float2 uv = (pixelCoord + 0.5) * _SSGITextureSize.zw;
+    
+    half4 color = SAMPLE_TEXTURE2D_X_LOD(_SourceTexture, sampler_LinearClamp, uv, 0);
+    
+    _RW_DestinationTexture[COORD_TEXTURE2D_X(pixelCoord)] = color;
+}
