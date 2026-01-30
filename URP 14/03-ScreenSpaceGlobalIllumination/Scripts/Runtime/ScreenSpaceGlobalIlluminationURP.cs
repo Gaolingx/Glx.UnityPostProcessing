@@ -640,6 +640,7 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
         private RTHandle m_IntermediateDiffuseHandle;
         private RTHandle m_AccumulateSampleHandle;
         private RTHandle m_APVLightingHandle;
+        private RTHandle m_SceneViewMotionVectorHandle;
 
         // Persistent history handles
         private RTHandle m_HistoryDepthHandle;
@@ -777,10 +778,11 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
             }
 
             // Allocate render textures
-            AllocateRenderTextures(width, height, ref historyData);
+            bool isSceneView = camera.cameraType == CameraType.SceneView;
+            AllocateRenderTextures(width, height, ref historyData, isSceneView);
         }
 
-        private void AllocateRenderTextures(int width, int height, ref CameraHistoryData historyData)
+        private void AllocateRenderTextures(int width, int height, ref CameraHistoryData historyData, bool isSceneView)
         {
             RenderTextureDescriptor desc = new RenderTextureDescriptor(width, height);
             desc.graphicsFormat = GraphicsFormat.B10G11R11_UFloatPack32;
@@ -852,7 +854,25 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
             RenderingUtils.ReAllocateIfNeeded(ref m_AccumulateSampleHandle, desc, FilterMode.Point, TextureWrapMode.Clamp, name: "_SSGISampleTexture");
             RenderingUtils.ReAllocateIfNeeded(ref historyData.accumulateHistorySampleHandle, desc, FilterMode.Point, TextureWrapMode.Clamp, name: "_SSGIHistorySampleTexture");
 #endif
+#if UNITY_EDITOR
+            if (isSceneView)
+            {
+                RenderTextureDescriptor motionVectorDesc = new RenderTextureDescriptor(width, height);
+                motionVectorDesc.graphicsFormat = GraphicsFormat.R16G16_SFloat;
+                motionVectorDesc.depthBufferBits = 0;
+                motionVectorDesc.stencilFormat = GraphicsFormat.None;
+                motionVectorDesc.msaaSamples = 1;
+                motionVectorDesc.enableRandomWrite = true;
 
+#if UNITY_6000_0_OR_NEWER
+                RenderingUtils.ReAllocateHandleIfNeeded(ref m_SceneViewMotionVectorHandle, motionVectorDesc, 
+                    FilterMode.Point, TextureWrapMode.Clamp, name: "_SceneViewMotionVectorTexture");
+#else
+                RenderingUtils.ReAllocateIfNeeded(ref m_SceneViewMotionVectorHandle, motionVectorDesc, 
+                    FilterMode.Point, TextureWrapMode.Clamp, name: "_SceneViewMotionVectorTexture");
+#endif
+            }
+#endif
             // Set texel size
             computeShader.SetVector(_IndirectDiffuseTexture_TexelSize, 
                 new Vector4(1.0f / ssgiWidth, 1.0f / ssgiHeight, ssgiWidth, ssgiHeight));
@@ -865,6 +885,7 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
             int height = (int)(camera.scaledPixelHeight * cameraData.renderScale);
             int ssgiWidth = Mathf.FloorToInt(width * resolutionScale);
             int ssgiHeight = Mathf.FloorToInt(height * resolutionScale);
+            bool isSceneView = camera.cameraType == CameraType.SceneView;
 
             ref var historyData = ref cameraHistoryData[cameraHistoryIndex];
 
@@ -880,7 +901,28 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
                 int ssgiThreadGroupsX = Mathf.CeilToInt(ssgiWidth / (float)THREAD_GROUP_SIZE_X);
                 int ssgiThreadGroupsY = Mathf.CeilToInt(ssgiHeight / (float)THREAD_GROUP_SIZE_Y);
                 RTHandle cameraDepthHandle = cameraData.renderer.cameraDepthTargetHandle;
+
+#if UNITY_EDITOR
+                Texture motionVectorRT;
+                if (isSceneView)
+                {
+                    // Pass 7: [Editor only] CameraMotionVectors
+                    cmd.SetComputeTextureParam(computeShader, KernelIndices.CameraMotionVectors, 
+                        _CameraDepthTexture, cameraDepthHandle);
+                    cmd.SetComputeTextureParam(computeShader, KernelIndices.CameraMotionVectors, 
+                        _RW_MotionVectorTexture, m_SceneViewMotionVectorHandle);
+                    cmd.DispatchCompute(computeShader, KernelIndices.CameraMotionVectors, 
+                        threadGroupsX, threadGroupsY, 1);
+
+                    motionVectorRT = m_SceneViewMotionVectorHandle;
+                }
+                else
+                {
+                    motionVectorRT = Shader.GetGlobalTexture("_MotionVectorTexture");
+                }
+#else
                 Texture motionVectorRT = Shader.GetGlobalTexture("_MotionVectorTexture");
+#endif
 
                 cmd.SetComputeTextureParam(computeShader, KernelIndices.CopyDirectLighting, _CameraDepthTexture, cameraDepthHandle);
                 cmd.SetComputeTextureParam(computeShader, KernelIndices.SSGIRayMarching, _CameraDepthTexture, cameraDepthHandle);
@@ -895,14 +937,14 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
                 cmd.SetComputeTextureParam(computeShader, KernelIndices.TemporalReprojection, _MotionVectorTexture, motionVectorRT);
                 cmd.SetComputeTextureParam(computeShader, KernelIndices.TemporalStabilization, _MotionVectorTexture, motionVectorRT);
 
-                // Kernel 0: Copy Direct Lighting
+                // Pass 0: Copy Direct Lighting
                 cmd.SetComputeTextureParam(computeShader, KernelIndices.CopyDirectLighting, _SourceTexture, colorHandle);
                 cmd.SetComputeTextureParam(computeShader, KernelIndices.CopyDirectLighting, _RW_IntermediateCameraColorTexture, m_IntermediateCameraColorHandle);
                 if (outputAPVLighting)
                     cmd.SetComputeTextureParam(computeShader, KernelIndices.CopyDirectLighting, _RW_APVLightingTexture, m_APVLightingHandle);
                 cmd.DispatchCompute(computeShader, KernelIndices.CopyDirectLighting, threadGroupsX, threadGroupsY, 1);
 
-                // Kernel 1: SSGI Ray Marching
+                // Pass 1: SSGI Ray Marching
                 cmd.SetComputeTextureParam(computeShader, KernelIndices.SSGIRayMarching, _IntermediateCameraColorTexture, m_IntermediateCameraColorHandle);
                 cmd.SetComputeTextureParam(computeShader, KernelIndices.SSGIRayMarching, _SSGIHistoryCameraColorTexture, historyData.historyCameraColorHandle);
                 cmd.SetComputeTextureParam(computeShader, KernelIndices.SSGIRayMarching, _SSGIHistoryDepthTexture, historyData.historyDepthHandle);
@@ -911,7 +953,7 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
 
                 if (enableDenoise)
                 {
-                    // Kernel 2: Temporal Reprojection
+                    // Pass 2: Temporal Reprojection
                     cmd.SetComputeTextureParam(computeShader, KernelIndices.TemporalReprojection, _IntermediateIndirectDiffuseTexture, m_IntermediateDiffuseHandle);
                     cmd.SetComputeTextureParam(computeShader, KernelIndices.TemporalReprojection, _HistoryIndirectDiffuseTexture, historyData.historyIndirectDiffuseHandle);
                     cmd.SetComputeTextureParam(computeShader, KernelIndices.TemporalReprojection, _SSGIHistorySampleTexture, historyData.accumulateHistorySampleHandle);
@@ -919,7 +961,7 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
                     cmd.SetComputeTextureParam(computeShader, KernelIndices.TemporalReprojection, _RW_SSGISampleTexture, m_AccumulateSampleHandle);
                     cmd.DispatchCompute(computeShader, KernelIndices.TemporalReprojection, ssgiThreadGroupsX, ssgiThreadGroupsY, 1);
 
-                    // Aggressive denoise (optional)
+                    // Pass 3: Aggressive denoise (optional)
                     if (ssgiVolume.denoiserAlgorithmSS.value == ScreenSpaceGlobalIlluminationVolume.DenoiserAlgorithm.Aggressive)
                     {
                         // First pass
@@ -933,15 +975,15 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
                         cmd.DispatchCompute(computeShader, KernelIndices.PoissonDiskDenoise, ssgiThreadGroupsX, ssgiThreadGroupsY, 1);
                     }
 
-                    // Second denoiser pass (optional)
+                    // Pass 4: Second denoiser pass (optional)
                     if (ssgiVolume.secondDenoiserPassSS.value)
                     {
-                        // Kernel 3: Spatial Denoise
+                        // Spatial Denoise
                         cmd.SetComputeTextureParam(computeShader, KernelIndices.SpatialDenoise, _SourceDiffuseTexture, m_DiffuseHandle);
                         cmd.SetComputeTextureParam(computeShader, KernelIndices.SpatialDenoise, _RW_IntermediateIndirectDiffuseTexture, m_IntermediateDiffuseHandle);
                         cmd.DispatchCompute(computeShader, KernelIndices.SpatialDenoise, ssgiThreadGroupsX, ssgiThreadGroupsY, 1);
 
-                        // Kernel 4: Temporal Stabilization
+                        // Temporal Stabilization
                         cmd.SetComputeTextureParam(computeShader, KernelIndices.TemporalStabilization, _SourceDiffuseTexture, m_IntermediateDiffuseHandle);
                         cmd.SetComputeTextureParam(computeShader, KernelIndices.TemporalStabilization, _HistoryIndirectDiffuseTexture, historyData.historyIndirectDiffuseHandle);
                         cmd.SetComputeTextureParam(computeShader, KernelIndices.TemporalStabilization, _RW_IndirectDiffuseTexture, m_DiffuseHandle);
@@ -958,18 +1000,18 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
                     cmd.CopyTexture(m_IntermediateDiffuseHandle, m_DiffuseHandle);
                 }
 
-                // Kernel 5: Copy History Depth
+                // Pass 5: Copy History Depth
                 cmd.SetComputeTextureParam(computeShader, KernelIndices.CopyHistoryDepth, _RW_SSGIHistoryDepthTexture, historyData.historyDepthHandle);
                 cmd.DispatchCompute(computeShader, KernelIndices.CopyHistoryDepth, ssgiThreadGroupsX, ssgiThreadGroupsY, 1);
 
-                // Kernel 6: Combine GI
+                // Pass 6: Combine GI
                 cmd.SetComputeTextureParam(computeShader, KernelIndices.CombineGI, _IndirectDiffuseTexture, m_DiffuseHandle);
                 cmd.SetComputeTextureParam(computeShader, KernelIndices.CombineGI, _IntermediateCameraColorTexture, m_IntermediateCameraColorHandle);
                 cmd.SetComputeTextureParam(computeShader, KernelIndices.CombineGI, _RW_CameraColorTexture, m_CombinedOutputHandle);
                 cmd.DispatchCompute(computeShader, KernelIndices.CombineGI, threadGroupsX, threadGroupsY, 1);
                 cmd.Blit(m_CombinedOutputHandle, colorHandle);
 
-                // Kernel 9: Copy to history camera color
+                // Pass 8: Copy to history camera color
                 cmd.SetComputeTextureParam(computeShader, KernelIndices.BlitColorTexture, _SourceTexture, colorHandle);
                 cmd.SetComputeTextureParam(computeShader, KernelIndices.BlitColorTexture, _RW_DestinationTexture, historyData.historyCameraColorHandle);
                 cmd.DispatchCompute(computeShader, KernelIndices.BlitColorTexture, ssgiThreadGroupsX, ssgiThreadGroupsY, 1);
@@ -990,6 +1032,7 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
             internal bool enableDenoise;
             internal bool outputAPVLighting;
             internal bool overrideAmbientLighting;
+            internal bool isSceneView;
 
             internal int width;
             internal int height;
@@ -999,6 +1042,7 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
             internal TextureHandle cameraColorHandle;
             internal TextureHandle cameraDepthHandle;
             internal TextureHandle motionVectorHandle;
+            internal TextureHandle sceneViewMotionVectorHandle;
 
             internal TextureHandle intermediateCameraColorHandle;
             internal TextureHandle combinedOutputHandle;
@@ -1045,6 +1089,28 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
                 cmd.SetComputeTextureParam(cs, KernelIndices.PoissonDiskDenoise, _GBuffer2, data.gBuffer2Handle);
             }
 
+#if UNITY_EDITOR
+            TextureHandle motionVectorTextureHandle;
+            if (data.isSceneView)
+            {
+                // Pass 7: [Editor only] CameraMotionVectors
+                cmd.SetComputeTextureParam(cs, KernelIndices.CameraMotionVectors, 
+                    _CameraDepthTexture, data.cameraDepthHandle);
+                cmd.SetComputeTextureParam(cs, KernelIndices.CameraMotionVectors, 
+                    _RW_MotionVectorTexture, data.sceneViewMotionVectorHandle);
+                cmd.DispatchCompute(cs, KernelIndices.CameraMotionVectors, 
+                    threadGroupsX, threadGroupsY, 1);
+
+                motionVectorTextureHandle = data.sceneViewMotionVectorHandle;
+            }
+            else
+            {
+                motionVectorTextureHandle = data.motionVectorHandle;
+            }
+#else
+            TextureHandle motionVectorTextureHandle = data.motionVectorHandle;
+#endif
+
             // Set common textures
             cmd.SetComputeTextureParam(cs, KernelIndices.CopyDirectLighting, _CameraDepthTexture, data.cameraDepthHandle);
             cmd.SetComputeTextureParam(cs, KernelIndices.SSGIRayMarching, _CameraDepthTexture, data.cameraDepthHandle);
@@ -1058,14 +1124,14 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
             cmd.SetComputeTextureParam(cs, KernelIndices.CombineGI, _CameraDepthTexture, data.cameraDepthHandle);
             cmd.SetComputeTextureParam(cs, KernelIndices.PoissonDiskDenoise, _CameraDepthTexture, data.cameraDepthHandle);
 
-            // Kernel 0: Copy Direct Lighting
+            // Pass 0: Copy Direct Lighting
             cmd.SetComputeTextureParam(cs, KernelIndices.CopyDirectLighting, _SourceTexture, data.cameraColorHandle);
             cmd.SetComputeTextureParam(cs, KernelIndices.CopyDirectLighting, _RW_IntermediateCameraColorTexture, data.intermediateCameraColorHandle);
             if (data.outputAPVLighting)
                 cmd.SetComputeTextureParam(cs, KernelIndices.CopyDirectLighting, _RW_APVLightingTexture, data.apvLightingHandle);
             cmd.DispatchCompute(cs, KernelIndices.CopyDirectLighting, threadGroupsX, threadGroupsY, 1);
 
-            // Kernel 1: SSGI Ray Marching
+            // Pass 1: SSGI Ray Marching
             cmd.SetComputeTextureParam(cs, KernelIndices.SSGIRayMarching, _IntermediateCameraColorTexture, data.intermediateCameraColorHandle);
             cmd.SetComputeTextureParam(cs, KernelIndices.SSGIRayMarching, _SSGIHistoryCameraColorTexture, data.historyCameraColorHandle);
             cmd.SetComputeTextureParam(cs, KernelIndices.SSGIRayMarching, _SSGIHistoryDepthTexture, data.historyDepthHandle);
@@ -1074,7 +1140,7 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
 
             if (data.enableDenoise)
             {
-                // Kernel 2: Temporal Reprojection
+                // Pass 2: Temporal Reprojection
                 cmd.SetComputeTextureParam(cs, KernelIndices.TemporalReprojection, _IntermediateIndirectDiffuseTexture, data.intermediateDiffuseHandle);
                 cmd.SetComputeTextureParam(cs, KernelIndices.TemporalReprojection, _HistoryIndirectDiffuseTexture, data.historyIndirectDiffuseHandle);
                 cmd.SetComputeTextureParam(cs, KernelIndices.TemporalReprojection, _SSGIHistorySampleTexture, data.accumulateHistorySampleHandle);
@@ -1082,7 +1148,7 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
                 cmd.SetComputeTextureParam(cs, KernelIndices.TemporalReprojection, _RW_SSGISampleTexture, data.accumulateSampleHandle);
                 cmd.DispatchCompute(cs, KernelIndices.TemporalReprojection, ssgiThreadGroupsX, ssgiThreadGroupsY, 1);
 
-                // Aggressive denoise
+                // Pass 3: Aggressive denoise
                 if (data.ssgiVolume.denoiserAlgorithmSS.value == ScreenSpaceGlobalIlluminationVolume.DenoiserAlgorithm.Aggressive)
                 {
                     cmd.SetComputeTextureParam(cs, KernelIndices.PoissonDiskDenoise, _SourceDiffuseTexture, data.diffuseHandle);
@@ -1094,7 +1160,7 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
                     cmd.DispatchCompute(cs, KernelIndices.PoissonDiskDenoise, ssgiThreadGroupsX, ssgiThreadGroupsY, 1);
                 }
 
-                // Second denoiser pass
+                // Pass 4: Second denoiser pass
                 if (data.ssgiVolume.secondDenoiserPassSS.value)
                 {
                     cmd.SetComputeTextureParam(cs, KernelIndices.SpatialDenoise, _SourceDiffuseTexture, data.diffuseHandle);
@@ -1115,18 +1181,18 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
                 cmd.CopyTexture(data.intermediateDiffuseHandle, data.diffuseHandle);
             }
 
-            // Kernel 5: Copy History Depth
+            // Pass 5: Copy History Depth
             cmd.SetComputeTextureParam(cs, KernelIndices.CopyHistoryDepth, _RW_SSGIHistoryDepthTexture, data.historyDepthHandle);
             cmd.DispatchCompute(cs, KernelIndices.CopyHistoryDepth, ssgiThreadGroupsX, ssgiThreadGroupsY, 1);
 
-            // Kernel 6: Combine GI
+            // Pass 6: Combine GI
             cmd.SetComputeTextureParam(cs, KernelIndices.CombineGI, _IndirectDiffuseTexture, data.diffuseHandle);
             cmd.SetComputeTextureParam(cs, KernelIndices.CombineGI, _IntermediateCameraColorTexture, data.intermediateCameraColorHandle);
             cmd.SetComputeTextureParam(cs, KernelIndices.CombineGI, _RW_CameraColorTexture, data.combinedOutputHandle);
             cmd.DispatchCompute(cs, KernelIndices.CombineGI, threadGroupsX, threadGroupsY, 1);
             cmd.Blit(data.combinedOutputHandle, data.cameraColorHandle);
 
-            // Copy to history
+            // Pass 8: Copy to history
             cmd.SetComputeTextureParam(cs, KernelIndices.BlitColorTexture, _SourceTexture, data.cameraColorHandle);
             cmd.SetComputeTextureParam(cs, KernelIndices.BlitColorTexture, _RW_DestinationTexture, data.historyCameraColorHandle);
             cmd.DispatchCompute(cs, KernelIndices.BlitColorTexture, ssgiThreadGroupsX, ssgiThreadGroupsY, 1);
@@ -1143,6 +1209,7 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
                 var camera = cameraData.camera;
                 int currentCameraHash = camera.GetHashCode();
                 int historyIndex = GetCameraHistoryDataIndex(currentCameraHash);
+                passData.isSceneView = camera.cameraType == CameraType.SceneView;
 
                 if (!hasProbeAtlas)
                 {
@@ -1273,6 +1340,24 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
                 TextureHandle historyDepthHandle = renderGraph.ImportTexture(historyData.historyDepthHandle);
                 TextureHandle accumulateSampleHandle = renderGraph.ImportTexture(m_AccumulateSampleHandle);
                 TextureHandle accumulateHistorySampleHandle = renderGraph.ImportTexture(historyData.accumulateHistorySampleHandle);
+
+#if UNITY_EDITOR
+                if (passData.isSceneView)
+                {
+                    RenderTextureDescriptor motionVectorDesc = cameraData.cameraTargetDescriptor;
+                    motionVectorDesc.graphicsFormat = GraphicsFormat.R16G16_SFloat;
+                    motionVectorDesc.depthBufferBits = 0;
+                    motionVectorDesc.msaaSamples = 1;
+                    motionVectorDesc.enableRandomWrite = true;
+
+                    TextureHandle sceneViewMotionVectorHandle = UniversalRenderer.CreateRenderGraphTexture(
+                        renderGraph, motionVectorDesc, "_SceneViewMotionVectorTexture", 
+                        false, FilterMode.Point, TextureWrapMode.Clamp);
+
+                    passData.sceneViewMotionVectorHandle = sceneViewMotionVectorHandle;
+                    builder.UseTexture(passData.sceneViewMotionVectorHandle, AccessFlags.ReadWrite);
+                }
+#endif
 
                 // Fill pass data
                 passData.computeShader = computeShader;
@@ -1442,6 +1527,9 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
             m_HistoryCameraColorHandle?.Release();
             m_HistoryIndirectDiffuseHandle?.Release();
             m_AccumulateHistorySampleHandle?.Release();
+#if UNITY_EDITOR
+            m_SceneViewMotionVectorHandle?.Release();
+#endif
 
             for (int i = 0; i < MAX_CAMERA_COUNT; i++)
             {

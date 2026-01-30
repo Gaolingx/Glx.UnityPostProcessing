@@ -137,7 +137,7 @@ RayHit RayMarching(Ray ray, float2 screenUV, half dither, half3 viewDirectionWS,
         // 2. Back-faces should be behind front-faces.
         bool backDepthValid = false; 
     #if defined(_BACKFACE_TEXTURES)
-        deviceBackDepth = SAMPLE_TEXTURE2D_X_LOD(_CameraBackDepthTexture, my_point_clamp_sampler, rayPositionNDC.xy, 0).r;
+        deviceBackDepth = SAMPLE_TEXTURE2D_X_LOD(_CameraBackDepthTexture, sampler_PointClamp, rayPositionNDC.xy, 0).r;
         sceneBackDepth = ConvertLinearEyeDepth(deviceBackDepth);
 
         backDepthValid = (deviceBackDepth != UNITY_RAW_FAR_CLIP_VALUE) && (sceneBackDepth >= sceneDepth);

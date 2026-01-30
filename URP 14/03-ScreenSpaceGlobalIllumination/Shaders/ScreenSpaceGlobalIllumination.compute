@@ -547,13 +547,11 @@ void CombineGI(uint3 dispatchThreadId : SV_DispatchThreadID)
     depth = lerp(UNITY_NEAR_CLIP_VALUE, 1, depth);
 #endif
     
-    // 读取直接光照（包含 Skybox）
     half4 directLighting = SAMPLE_TEXTURE2D_X_LOD(_IntermediateCameraColorTexture, sampler_PointClamp, screenUV, 0);
     bool isBackground = abs(depth - UNITY_RAW_FAR_CLIP_VALUE) < RAW_FAR_CLIP_THRESHOLD;
     
     if (isBackground)
     {
-        // [修复] 对于 Skybox 像素，直接写入原始颜色，确保 Skybox 被正确复制
         _RW_CameraColorTexture[COORD_TEXTURE2D_X(pixelCoord)] = directLighting;
         return;
     }
