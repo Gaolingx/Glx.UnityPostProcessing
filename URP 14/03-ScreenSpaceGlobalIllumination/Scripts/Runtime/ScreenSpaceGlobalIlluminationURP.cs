@@ -1114,12 +1114,12 @@ public class ScreenSpaceGlobalIlluminationURP : ScriptableRendererFeature
             // Set common textures
             cmd.SetComputeTextureParam(cs, KernelIndices.CopyDirectLighting, _CameraDepthTexture, data.cameraDepthHandle);
             cmd.SetComputeTextureParam(cs, KernelIndices.SSGIRayMarching, _CameraDepthTexture, data.cameraDepthHandle);
-            cmd.SetComputeTextureParam(cs, KernelIndices.SSGIRayMarching, _MotionVectorTexture, data.motionVectorHandle);
+            cmd.SetComputeTextureParam(cs, KernelIndices.SSGIRayMarching, _MotionVectorTexture, motionVectorTextureHandle);
             cmd.SetComputeTextureParam(cs, KernelIndices.TemporalReprojection, _CameraDepthTexture, data.cameraDepthHandle);
-            cmd.SetComputeTextureParam(cs, KernelIndices.TemporalReprojection, _MotionVectorTexture, data.motionVectorHandle);
+            cmd.SetComputeTextureParam(cs, KernelIndices.TemporalReprojection, _MotionVectorTexture, motionVectorTextureHandle);
             cmd.SetComputeTextureParam(cs, KernelIndices.SpatialDenoise, _CameraDepthTexture, data.cameraDepthHandle);
             cmd.SetComputeTextureParam(cs, KernelIndices.TemporalStabilization, _CameraDepthTexture, data.cameraDepthHandle);
-            cmd.SetComputeTextureParam(cs, KernelIndices.TemporalStabilization, _MotionVectorTexture, data.motionVectorHandle);
+            cmd.SetComputeTextureParam(cs, KernelIndices.TemporalStabilization, _MotionVectorTexture, motionVectorTextureHandle);
             cmd.SetComputeTextureParam(cs, KernelIndices.CopyHistoryDepth, _CameraDepthTexture, data.cameraDepthHandle);
             cmd.SetComputeTextureParam(cs, KernelIndices.CombineGI, _CameraDepthTexture, data.cameraDepthHandle);
             cmd.SetComputeTextureParam(cs, KernelIndices.PoissonDiskDenoise, _CameraDepthTexture, data.cameraDepthHandle);
