@@ -73,7 +73,7 @@ namespace Glx.PostProcess.URP.Runtime
             private RTHandle m_BokehTexture;
             private RTHandle m_ResultTexture;
 
-            // Shader Property IDs - 读取用
+            // Shader Property IDs
             private static readonly int _SourceTex = Shader.PropertyToID("_SourceTex");
             private static readonly int _DepthTex = Shader.PropertyToID("_DepthTex");
             private static readonly int _CoCTexRead = Shader.PropertyToID("_CoCTexRead");
@@ -81,7 +81,7 @@ namespace Glx.PostProcess.URP.Runtime
             private static readonly int _DownsampledCoCTexRead = Shader.PropertyToID("_DownsampledCoCTexRead");
             private static readonly int _BokehTexRead = Shader.PropertyToID("_BokehTexRead");
 
-            // Shader Property IDs - 写入用 (RWTexture2D)
+            // Shader Property IDs
             private static readonly int _CoCTex = Shader.PropertyToID("_CoCTex");
             private static readonly int _DownsampledColorTex = Shader.PropertyToID("_DownsampledColorTex");
             private static readonly int _DownsampledCoCTex = Shader.PropertyToID("_DownsampledCoCTex");
@@ -94,7 +94,6 @@ namespace Glx.PostProcess.URP.Runtime
             private static readonly int _DOFParams = Shader.PropertyToID("_DOFParams");
             private static readonly int _BlurParams = Shader.PropertyToID("_BlurParams");
             private static readonly int _BokehParams = Shader.PropertyToID("_BokehParams");
-            private static readonly int _CameraParams = Shader.PropertyToID("_CameraParams");
 
             private const string PROFILER_TAG = "Bokeh DOF";
             private ProfilingSampler m_ProfilingSampler = new ProfilingSampler(PROFILER_TAG);
@@ -213,17 +212,12 @@ namespace Glx.PostProcess.URP.Runtime
                 Vector4 blurParams = new Vector4(nearScale, farScale, maxBlur * m_Settings.downsampleScale, 0);
                 Vector4 bokehParams = new Vector4(bokehIntensity, highlightThreshold, 0, 0);
 
-                float near = cameraData.camera.nearClipPlane;
-                float far = cameraData.camera.farClipPlane;
-                Vector4 cameraParams = new Vector4(near, far, far - near, near * far);
-
                 // Set global parameters
                 cmd.SetComputeVectorParam(m_ComputeShader, _SourceSize, sourceSize);
                 cmd.SetComputeVectorParam(m_ComputeShader, _DownsampledSize, downsampledSize);
                 cmd.SetComputeVectorParam(m_ComputeShader, _DOFParams, dofParams);
                 cmd.SetComputeVectorParam(m_ComputeShader, _BlurParams, blurParams);
                 cmd.SetComputeVectorParam(m_ComputeShader, _BokehParams, bokehParams);
-                cmd.SetComputeVectorParam(m_ComputeShader, _CameraParams, cameraParams);
 
                 int threadGroupsX, threadGroupsY;
 
